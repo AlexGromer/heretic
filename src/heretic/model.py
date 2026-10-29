@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeAlias, cast
 
@@ -68,6 +69,63 @@ def _collapse_flattened_residual_streams(
         h.unflatten(-1, (streams, hidden_size)).mean(-2) if h.shape[-1] == width else h
         for h in hidden_states
     )
+
+
+# Names of the 3D (expert, ...) parameters that hold the down projections
+# of all experts of a layer in models with fused experts (Transformers v5).
+# Granite MoE stores them as the "weight" of an "output_linear" module instead.
+FUSED_DOWN_PROJECTION_NAMES = ("down_proj", "w2")
+
+# The attributes of a decoder layer that can hold a MoE block.
+MOE_BLOCK_NAMES = ("mlp", "block_sparse_moe", "moe", "feed_forward")
+
+# The component whose Optuna parameters (max_weight etc.) are reused for fused experts.
+FUSED_EXPERTS_WEIGHT_COMPONENT = "mlp.down_proj"
+
+# Models whose fused down projection is not stored as (expert, hidden, intermediate)
+# like most others, but as (expert, intermediate, hidden), because their experts
+# compute `hidden @ down_proj[expert]` (see GptOssExperts in Transformers 5.20.2).
+# Needed because hidden_size equals the intermediate size in some of these models,
+# so the orientation cannot be inferred from the shape alone.
+FUSED_ROW_AXIS_BY_MODEL_TYPE = {"gpt_oss": 2}
+
+
+@dataclass
+class FusedExperts:
+    """
+    Handle for the fused down projection of all routed experts of one layer.
+
+    Unlike the modules returned by Model.get_layer_modules, this is not a Linear
+    layer (so it cannot be a PEFT LoRA target), but one 3D parameter that holds
+    the weights of all experts, with the expert index as the leading axis.
+    It is modified directly, see Model.begin_fused_edit.
+    """
+
+    layer_index: int
+    # Name of the component under which the fused experts are listed.
+    component: str
+    # Path of the parameter relative to the decoder layer, e.g. "mlp.experts.down_proj".
+    path: str
+    # The module that directly owns the parameter.
+    module: Module
+    # Name of the parameter within that module, e.g. "down_proj".
+    parameter_name: str
+    # The axis (1 or 2) of the parameter that indexes the hidden (output) dimension.
+    # Along this axis, the "rows" of each expert's weight matrix are indexed
+    # in the sense of a Linear weight of shape (out_features, in_features).
+    row_axis: int
+
+    @property
+    def parameter(self) -> Tensor:
+        return getattr(self.module, self.parameter_name)
+
+    @property
+    def num_experts(self) -> int:
+        return self.parameter.shape[0]
+
+    @property
+    def key(self) -> tuple[int, str]:
+        return (self.layer_index, self.path)
 
 
 # Some chat templates (e.g. gpt-oss) insert the current date into the prompt,
@@ -170,6 +228,8 @@ class Model:
 
         self.trusted_models = set()
 
+        self._reset_fused_experts_state()
+
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
 
@@ -245,6 +305,23 @@ class Model:
         print("* Abliterable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
+
+        fused_components: dict[str, tuple[int, int]] = {}
+        for layer_index in range(len(self.get_layers())):
+            for component, fused_list in self.get_layer_fused_experts(
+                layer_index
+            ).items():
+                tensors, experts = fused_components.get(component, (0, 0))
+                fused_components[component] = (
+                    tensors + len(fused_list),
+                    experts + sum(fused.num_experts for fused in fused_list),
+                )
+
+        for component, (tensors, experts) in fused_components.items():
+            print(
+                f"  * [bold]{component}[/] (fused): [bold]{tensors}[/] tensors "
+                f"with [bold]{experts}[/] experts total"
+            )
 
     def apply_lora(self, lora_rank: int):
         # Guard against calling this method at the wrong time.
@@ -356,6 +433,10 @@ class Model:
                 if name in adapter_state:
                     param.data = adapter_state[name].to(param.device)
 
+            # Fused experts are modified directly rather than through the adapters,
+            # so the reloaded base model doesn't contain those modifications yet.
+            self._copy_modified_fused_experts_to(base_model)
+
             # Merge and unload
             print("* Merging LoRA adapters into base model...")
             merged_model = peft_model.merge_and_unload()
@@ -392,10 +473,14 @@ class Model:
             # Zeroing A as well ensures that adapter weights of modules not modified
             # by the next trial don't depend on what previous trials did.
             self._zero_lora_weights()
+            # Fused experts are not part of the adapter, so they are restored separately.
+            self.restore_fused_experts()
             return True
 
         # Purge existing model object from memory to make space.
         self.model = None
+        # The backups belong to the model that was just purged.
+        self._reset_fused_experts_state()
         empty_cache()
 
         quantization_config = self._get_quantization_config(
@@ -424,18 +509,20 @@ class Model:
         return False
 
     def get_layers(self) -> ModuleList:
-        model = self.model
+        return self._get_layers_of(self.model)
 
+    @staticmethod
+    def _get_layers_of(model: Any) -> ModuleList:
         # Unwrap PeftModel (always true after _apply_lora)
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
         # Most multimodal models.
         with suppress(Exception):
-            return model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+            return model.model.language_model.layers
 
         # Text-only models.
-        return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+        return model.model.layers
 
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
@@ -515,7 +602,9 @@ class Model:
 
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
-        assert total_modules > 0, "No abliterable modules found in layer"
+        assert total_modules > 0 or self.get_layer_fused_experts(layer_index), (
+            "No abliterable modules found in layer"
+        )
 
         return modules
 
@@ -527,7 +616,182 @@ class Model:
         for layer_index in range(len(self.get_layers())):
             components.update(self.get_layer_modules(layer_index).keys())
 
+            # Fused experts don't get their own component here, because they reuse
+            # the parameters of the "mlp.down_proj" component. The search space
+            # therefore has the same shape as for models with separate experts.
+            if self.get_layer_fused_experts(layer_index):
+                components.add(FUSED_EXPERTS_WEIGHT_COMPONENT)
+
         return sorted(components)
+
+    def get_layer_fused_experts(
+        self, layer_index: int
+    ) -> dict[str, list[FusedExperts]]:
+        """
+        Finds the fused routed experts of a layer, which Transformers v5 stores
+        as a single 3D parameter (expert, ...) per projection instead of
+        one Linear module per expert, so get_layer_modules cannot see them.
+        Currently only the down projection is supported, as the ablation
+        only targets the modules that write into the residual stream.
+        """
+        layer = self.get_layers()[layer_index]
+        config = self.model.config.get_text_config()
+        hidden_size = config.hidden_size
+        row_axis_override = FUSED_ROW_AXIS_BY_MODEL_TYPE.get(
+            getattr(config, "model_type", None)
+        )
+
+        found: dict[str, list[FusedExperts]] = {}
+
+        for block_name in MOE_BLOCK_NAMES:
+            block = getattr(layer, block_name, None)
+
+            if not isinstance(block, Module):
+                continue
+
+            for module_name, module in block.named_modules():
+                for parameter_name, parameter in module.named_parameters(recurse=False):
+                    if parameter.dim() != 3:
+                        continue
+
+                    is_down_projection = (
+                        parameter_name in FUSED_DOWN_PROJECTION_NAMES
+                        or (
+                            parameter_name == "weight"
+                            and module_name.split(".")[-1] == "output_linear"
+                        )
+                    )
+                    if not is_down_projection:
+                        continue
+
+                    path = ".".join(
+                        part
+                        for part in (block_name, module_name, parameter_name)
+                        if part
+                    )
+
+                    # The hidden dimension is the output of the down projection.
+                    # Determine which axis it is from the shape, and refuse to guess
+                    # if that is ambiguous, because a wrong axis would silently
+                    # ablate the wrong thing.
+                    candidates = [
+                        axis for axis in (1, 2) if parameter.shape[axis] == hidden_size
+                    ]
+                    if row_axis_override is not None:
+                        candidates = [row_axis_override]
+                    if len(candidates) != 1:
+                        self._warn_once(
+                            f"unsupported:{path}",
+                            f"[yellow]WARNING: Fused experts [bold]{path}[/] "
+                            f"have shape {tuple(parameter.shape)}, from which the hidden "
+                            f"dimension ({hidden_size}) cannot be determined uniquely. "
+                            "They are skipped and will not be abliterated.[/]",
+                        )
+                        continue
+
+                    fused = FusedExperts(
+                        layer_index=layer_index,
+                        component="mlp.experts.down_proj",
+                        path=path,
+                        module=module,
+                        parameter_name=parameter_name,
+                        row_axis=candidates[0],
+                    )
+                    assert parameter.shape[fused.row_axis] == hidden_size, (
+                        f"Axis {fused.row_axis} of {path} does not match "
+                        f"the hidden size {hidden_size}"
+                    )
+                    found.setdefault(fused.component, []).append(fused)
+
+        return found
+
+    def has_fused_experts(self) -> bool:
+        return any(
+            self.get_layer_fused_experts(layer_index)
+            for layer_index in range(len(self.get_layers()))
+        )
+
+    def _warn_once(self, key: str, message: str):
+        if key not in self._warnings_shown:
+            self._warnings_shown.add(key)
+            print()
+            print(message)
+
+    def _reset_fused_experts_state(self):
+        # Original values of the fused expert tensors that were modified
+        # since the model was loaded, by (layer index, parameter path).
+        self._fused_backups: dict[tuple[int, str], Tensor] = {}
+        # The tensors whose current values differ from the backups.
+        self._fused_modified: set[tuple[int, str]] = set()
+        self._warnings_shown: set[str] = set()
+
+    def begin_fused_edit(self, fused: FusedExperts):
+        """
+        Must be called before the weights of fused experts are modified in place.
+        Keeps a copy of the original values (on the device given by
+        settings.fused_experts_backup_device, the CPU by default), so that
+        restore_fused_experts can undo the modification bit-exactly.
+        Unlike LoRA adapters, which are zeroed to undo them, in-place edits of
+        low-precision weights cannot be reversed arithmetically.
+        """
+        key = fused.key
+
+        if key not in self._fused_backups:
+            parameter = fused.parameter.detach()
+            backup = torch.empty_like(
+                parameter,
+                device=self.settings.fused_experts_backup_device,
+            )
+            self._fused_backups[key] = backup.copy_(parameter)
+
+        self._fused_modified.add(key)
+
+    def has_modified_fused_experts(self) -> bool:
+        return bool(self._fused_modified)
+
+    def restore_fused_experts(self):
+        """
+        Restores all fused expert tensors modified via begin_fused_edit
+        to their original values.
+        """
+        if not self._fused_modified:
+            return
+
+        # Index the current handles by key instead of walking all layers
+        # once per modified tensor.
+        handles = {
+            fused.key: fused
+            for layer_index in {key[0] for key in self._fused_modified}
+            for fused_list in self.get_layer_fused_experts(layer_index).values()
+            for fused in fused_list
+        }
+
+        with torch.no_grad():
+            for key in self._fused_modified:
+                handles[key].parameter.copy_(self._fused_backups[key])
+
+        self._fused_modified.clear()
+
+    def _copy_modified_fused_experts_to(self, other_model: Any):
+        """
+        Copies the current values of all modified fused expert tensors
+        into the corresponding tensors of another instance of the same model.
+        """
+        other_layers = self._get_layers_of(other_model)
+
+        with torch.no_grad():
+            for layer_index, path in self._fused_modified:
+                source = next(
+                    fused
+                    for fused_list in self.get_layer_fused_experts(layer_index).values()
+                    for fused in fused_list
+                    if fused.path == path
+                )
+                target = other_layers[layer_index]
+                for part in path.split("."):
+                    target = getattr(target, part)
+
+                cast(Tensor, target).copy_(source.parameter)
 
     def _apply_system_role(
         self, messages: list[dict[str, str]]
