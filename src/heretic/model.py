@@ -18,6 +18,7 @@ from transformers import (
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
+    FineGrainedFP8Config,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -31,6 +32,29 @@ from transformers.generation import (
 from .config import QuantizationMethod, Settings
 from .system import empty_cache
 from .utils import Prompt, batchify, format_exception, print
+
+
+def get_fp8_quantization_config(
+    model: str,
+    **revision_kwargs: Any,
+) -> dict[str, Any] | None:
+    """
+    Returns the quantization_config of a checkpoint whose weights are stored in
+    FP8 (quant_method "fp8", i.e. transformers' fine-grained FP8), or None for every
+    other model, including checkpoints that use other quantization methods.
+    """
+    configs = PretrainedConfig.get_config_dict(model, **revision_kwargs)
+
+    for config in configs:
+        quantization_config = config.get("quantization_config")
+
+        if (
+            isinstance(quantization_config, dict)
+            and str(quantization_config.get("quant_method", "")).lower() == "fp8"
+        ):
+            return quantization_config
+
+    return None
 
 
 def get_model_class(
@@ -160,6 +184,28 @@ class Model:
         # role. Templates that don't (e.g. Gemma 2) need the system prompt folded
         # into the first user message instead (see _apply_system_role).
         self.supports_system_role = chat_template_supports_system_role(self.tokenizer)
+
+        # FP8 checkpoints can't be abliterated in place: PyTorch has no addmm/matmul
+        # kernels for FP8 on most devices, and the LoRA adapters operate on the
+        # layers' outputs in the compute dtype. The weights are therefore dequantized
+        # to the compute dtype (usually bfloat16) while loading, and the merged
+        # export is a plain checkpoint without quantization_config.
+        self.fp8_quantization_config = get_fp8_quantization_config(
+            settings.model,
+            **self.revision_kwargs,
+        )
+        if self.fp8_quantization_config is not None:
+            if settings.quantization == QuantizationMethod.BNB_4BIT:
+                raise Exception(
+                    "This checkpoint is quantized with FP8, which can't be combined with "
+                    'quantization = "bnb_4bit". Use the default (quantization = "none"; '
+                    "the weights are dequantized while loading) or a BF16 checkpoint."
+                )
+
+            print(
+                "* [yellow]FP8 checkpoint detected: dequantizing the weights while loading. "
+                "The exported model will not be FP8-quantized.[/]"
+            )
 
         self.model = None
         self.max_memory = (
@@ -295,7 +341,10 @@ class Model:
             if ("lora_A" in name or "lora_B" in name) and hasattr(module, "weight"):
                 torch.nn.init.zeros_(module.weight)
 
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _get_quantization_config(
+        self,
+        dtype: str,
+    ) -> BitsAndBytesConfig | FineGrainedFP8Config | None:
         """
         Creates quantization config based on settings.
 
@@ -303,8 +352,17 @@ class Model:
             dtype: The dtype string (e.g., "auto", "bfloat16")
 
         Returns:
-            BitsAndBytesConfig or None
+            BitsAndBytesConfig, FineGrainedFP8Config (for FP8 checkpoints) or None
         """
+        if self.fp8_quantization_config is not None:
+            # Start from the checkpoint's own configuration so that settings such as
+            # the list of unquantized modules are preserved, and only change how
+            # it is loaded. Without explicit dequantize=True, transformers keeps
+            # the weights in FP8 on GPUs that support it.
+            return FineGrainedFP8Config.from_dict(
+                {**self.fp8_quantization_config, "dequantize": True}
+            )
+
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
             if dtype == "auto":
@@ -319,6 +377,25 @@ class Model:
                 bnb_4bit_use_double_quant=True,
             )
         return None
+
+    def _strip_fp8_quantization(self, model: PreTrainedModel):
+        """
+        Makes a model that was dequantized while loading an FP8 checkpoint export as
+        a plain model. Otherwise, save_pretrained would write quantization_config
+        into config.json, and the reverse of the dequantization that is recorded
+        in the model's weight conversions would quantize every weight back to FP8.
+        """
+        if self.fp8_quantization_config is None:
+            return
+
+        for config in (model.config, model.config.get_text_config()):
+            if hasattr(config, "quantization_config"):
+                del config.quantization_config
+
+        # Forget how the weights were loaded. Transformers then derives the conversions
+        # for saving from the model class alone, as for a model that was not loaded
+        # from a checkpoint, which contain no FP8 handling.
+        model._weight_conversions = None  # ty:ignore[invalid-assignment]
 
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
@@ -367,6 +444,7 @@ class Model:
             # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
             self.needs_reload = True
+            self._strip_fp8_quantization(merged_model)
             return merged_model
 
     def reset_model(self) -> bool:
