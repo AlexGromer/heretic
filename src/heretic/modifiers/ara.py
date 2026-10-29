@@ -265,6 +265,15 @@ class ARA(Modifier[Parameters]):
         ):
             for component, modules in model.get_layer_modules(layer_index).items():
                 for module_index, module in enumerate(modules):
+                    # Modules whose I/O could not be recorded (e.g. because they only
+                    # see some of the tokens) cannot be optimized.
+                    if module_index not in self.good_module_io[layer_index].get(
+                        component, {}
+                    ) or module_index not in self.bad_module_io[layer_index].get(
+                        component, {}
+                    ):
+                        continue
+
                     # Cast to Linear to access weights and LoRA adapters.
                     module = cast(Linear, module)
 

@@ -44,6 +44,36 @@ def get_model_class(
         return AutoModelForCausalLM
 
 
+def reshape_module_io(
+    tensor: Tensor,
+    batch_shape: tuple[int, int] | None,
+) -> Tensor | None:
+    """
+    Extracts the vectors at the last position of each prompt from a module's
+    input or output, or returns None if that is not possible.
+
+    batch_shape is (prompt, position) of the forward pass, or None if unknown.
+    Most modules see tensors of shape (prompt, position, component), but MoE blocks
+    flatten them to (prompt * position, component), which this reshapes. Modules that
+    only see a subset of the tokens (e.g. routed experts that process just the tokens
+    routed to them) have inputs of any other height, from which the last position
+    of each prompt cannot be recovered, so None is returned for them.
+    """
+    if batch_shape is None:
+        # Without knowing the batch shape, the tensor can only be taken at face value.
+        return tensor[:, -1, :] if tensor.dim() >= 3 else None
+
+    prompt_count, position_count = batch_shape
+
+    if tensor.dim() == 2 and tensor.shape[0] == prompt_count * position_count:
+        tensor = tensor.reshape(prompt_count, position_count, tensor.shape[1])
+
+    if tensor.dim() < 3 or tuple(tensor.shape[:2]) != (prompt_count, position_count):
+        return None
+
+    return tensor[:, -1, :]
+
+
 def _collapse_flattened_residual_streams(
     hidden_states: tuple[FloatTensor, ...],
     config: Any,
@@ -121,6 +151,9 @@ class Model:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.needs_reload = False
+
+        # Keys of the warnings that were already shown (see _warn_once).
+        self._warnings_shown: set[str] = set()
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -768,6 +801,12 @@ class Model:
 
         return (running_sum / total_count).to(torch.float32)
 
+    def _warn_once(self, key: str, message: str):
+        if key not in self._warnings_shown:
+            self._warnings_shown.add(key)
+            print()
+            print(message)
+
     def get_module_io(
         self,
         prompts: list[Prompt],
@@ -776,7 +815,31 @@ class Model:
         # Each element maps from the component name to a (possibly sparse) mapping
         # from the module index to an (input, output) tuple containing the I/O
         # tensors of shape (prompt, component).
-        module_io: ModuleIO = []
+        module_io: ModuleIO = [{} for _ in range(len(self.get_layers()))]
+
+        # The (prompt, position) shape of the hidden states entering each layer
+        # during the current forward pass. Modules inside MoE blocks might see
+        # the hidden states flattened to (prompt * position, component),
+        # and this is needed to recover the prompt dimension.
+        batch_shapes: dict[int, tuple[int, int]] = {}
+
+        def get_layer_hook(
+            layer_index: int,
+        ) -> Callable[[Module, tuple[Any, ...], dict[str, Any]], None]:
+            def hook(
+                module: Module,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+            ) -> None:
+                hidden_states = args[0] if args else kwargs.get("hidden_states")
+
+                if isinstance(hidden_states, Tensor) and hidden_states.dim() >= 3:
+                    batch_shapes[layer_index] = (
+                        hidden_states.shape[0],
+                        hidden_states.shape[1],
+                    )
+
+            return hook
 
         def get_hook(
             layer_index: int,
@@ -788,26 +851,37 @@ class Model:
                 inputs: tuple[Tensor, ...],
                 outputs: Tensor,
             ) -> None:
-                if len(module_io) == layer_index:
-                    # First invocation of the hook for this layer.
-                    module_io.append({})
+                # inputs[0] and outputs have shape (prompt, position, component),
+                # or (prompt * position, component) for modules in MoE blocks that are
+                # applied to the flattened hidden states. This extracts the input/output
+                # at the end of each prompt.
+                batch_shape = batch_shapes.get(layer_index)
+                input = reshape_module_io(inputs[0], batch_shape)
+                output = reshape_module_io(outputs, batch_shape)
 
-                # Layers are invoked in order during inference,
-                # so this should always hold.
-                assert len(module_io) == layer_index + 1
+                if input is None or output is None:
+                    # The module only sees some of the tokens (e.g. a routed expert),
+                    # so the end of each prompt cannot be recovered from its I/O.
+                    self._warn_once(
+                        f"sparse-io:{component}",
+                        f"[yellow]WARNING: Modules of component [bold]{component}[/] "
+                        f"received input of shape {tuple(inputs[0].shape)}, which is neither "
+                        "(prompt, position, component) nor (prompt * position, component). "
+                        "Their I/O cannot be recorded and these modules are skipped.[/]",
+                    )
+                    return
 
+                # Only components with recorded I/O get an entry; skipped ones stay absent.
                 if component not in module_io[layer_index]:
                     module_io[layer_index][component] = {}
 
                 # Each module should be invoked at most once per inference step.
                 assert module_index not in module_io[layer_index][component]
 
-                # inputs[0] and outputs have shape (prompt, position, component),
-                # so this extracts the input/output at the end of each prompt.
                 # Move to CPU to decouple from device assignments, which can
                 # change between model reloads in multi-GPU configurations.
-                input = inputs[0][:, -1, :].detach().clone().cpu()
-                output = outputs[:, -1, :].detach().clone().cpu()
+                input = input.detach().clone().cpu()
+                output = output.detach().clone().cpu()
 
                 # The modules associated with a component (e.g. expert MLPs)
                 # are not necessarily invoked in order, nor are all of them
@@ -819,7 +893,14 @@ class Model:
 
         hook_handles: list[RemovableHandle] = []
 
-        for layer_index in range(len(self.get_layers())):
+        for layer_index, layer in enumerate(self.get_layers()):
+            hook_handles.append(
+                layer.register_forward_pre_hook(
+                    get_layer_hook(layer_index),
+                    with_kwargs=True,
+                )
+            )
+
             for component, modules in self.get_layer_modules(layer_index).items():
                 for module_index, module in enumerate(modules):
                     hook_handles.append(
@@ -828,10 +909,11 @@ class Model:
                         )
                     )
 
-        self.generate(prompts, max_new_tokens=1)
-
-        for hook_handle in hook_handles:
-            hook_handle.remove()
+        try:
+            self.generate(prompts, max_new_tokens=1)
+        finally:
+            for hook_handle in hook_handles:
+                hook_handle.remove()
 
         return module_io
 
