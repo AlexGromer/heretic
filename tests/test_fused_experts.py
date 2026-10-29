@@ -13,14 +13,18 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
+from torch.nn import Module
 
 from heretic.config import ExportStrategy, QuantizationMethod, Settings
 from heretic.main import obtain_export_strategy
 from heretic.model import Model, get_model_class, reshape_module_io
+from heretic.modifier import Context
 from heretic.modifiers.abliteration import RowNormalization, ablate_fused_experts
 from heretic.modifiers.ara import ARA, get_fused_experts_warning
 from heretic.modifiers.ara import Parameters as ARAParameters
@@ -104,7 +108,7 @@ class FusedDiscoveryTests(unittest.TestCase):
             self.assertEqual(handle.parameter.shape[1], hidden_size)
             self.assertIs(
                 handle.parameter,
-                get_model().get_layers()[layer_index].mlp.experts.down_proj,
+                cast(Any, get_model().get_layers()[layer_index]).mlp.experts.down_proj,
             )
 
     def test_module_based_callers_are_unaffected(self) -> None:
@@ -346,6 +350,14 @@ class FusedAblationTests(unittest.TestCase):
             model.settings.export_strategy = None
 
 
+def get_shared_down_projection(layer: Module) -> Module:
+    return cast(Any, layer).mlp.shared_expert.down_proj
+
+
+def get_lora_b(module: Module) -> Tensor:
+    return cast(Any, module).lora_B["default"].weight
+
+
 class ModuleIOTests(unittest.TestCase):
     def test_reshape_module_io(self) -> None:
         three_dimensional = torch.arange(24.0).view(2, 3, 4)
@@ -391,7 +403,7 @@ class ModuleIOTests(unittest.TestCase):
         # expert that only receives some of the tokens. Broadcasting keeps the
         # forward pass valid.
         handles = [
-            layer.mlp.shared_expert.down_proj.register_forward_pre_hook(
+            get_shared_down_projection(layer).register_forward_pre_hook(
                 lambda module, args: (args[0][:1],)
             )
             for layer in model.get_layers()
@@ -421,7 +433,7 @@ class ModuleIOTests(unittest.TestCase):
 
         # The shared expert's input is sparse, so its I/O is not recorded.
         handles = [
-            layer.mlp.shared_expert.down_proj.register_forward_pre_hook(
+            get_shared_down_projection(layer).register_forward_pre_hook(
                 lambda module, args: (args[0][:1],)
             )
             for layer in model.get_layers()
@@ -445,7 +457,7 @@ class ModuleIOTests(unittest.TestCase):
         # Must not raise a KeyError for the component without recorded I/O.
         with redirect_stdout(io.StringIO()):
             modifier.modify_model(
-                SimpleNamespace(get_model=lambda: model),
+                cast(Context, SimpleNamespace(get_model=lambda: model)),
                 ARAParameters(0, layer_count, 0.5, 0.1, 0.5, 1),
             )
 
@@ -453,13 +465,13 @@ class ModuleIOTests(unittest.TestCase):
 
         # The skipped modules are untouched (LoRA B starts at zero), the others are optimized.
         shared_b = [
-            module.lora_B["default"].weight
+            get_lora_b(module)
             for layer_index in range(layer_count)
             for module in model.get_layer_modules(layer_index)["mlp.down_proj"]
         ]
         self.assertTrue(all(not b.any() for b in shared_b))
         other_b = [
-            module.lora_B["default"].weight
+            get_lora_b(module)
             for layer_index in range(layer_count)
             for component, modules in model.get_layer_modules(layer_index).items()
             if component != "mlp.down_proj"
@@ -469,7 +481,7 @@ class ModuleIOTests(unittest.TestCase):
 
     def test_ara_warns_about_fused_experts(self) -> None:
         warning = get_fused_experts_warning(get_model())
-        self.assertIsNotNone(warning)
+        assert warning is not None
         self.assertIn("Abliteration", warning)
         self.assertIn("routed experts", warning)
 
