@@ -77,8 +77,11 @@ Two independent causes:
   check the model config).
 * Edits and the Linear LoRA parts of `Abliteration` are independent; Linear `full`
   normalization stays low-rank approximate.
-* `gpt_oss` orientation, Granite-style `output_linear` and the 4-bit merge path are
-  implemented from the transformers source but not covered by CPU tests here.
+* `gpt_oss` orientation and Granite-style `output_linear` are implemented from the
+  transformers source but not covered by CPU tests here. The 4-bit merge path (base model
+  reloaded on CPU, modified fused weights copied in) is covered by
+  `test_merge_4bit_branch_contains_modified_weights`; it only depends on the setting, not on
+  bitsandbytes or a GPU.
 * Only validated on CPU with `tiny-random/qwen3.5-moe` and transformers 5.20.2; not run on
   the real 35B model.
 

@@ -5,21 +5,26 @@
 # models like Qwen3.5 MoE. They run on CPU with the tiny model that is also used
 # by the end-to-end test in tests/qwen3.5-moe.
 
+import io
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from heretic.config import ExportStrategy, Settings
+from heretic.config import ExportStrategy, QuantizationMethod, Settings
 from heretic.main import obtain_export_strategy
 from heretic.model import Model, get_model_class, reshape_module_io
 from heretic.modifiers.abliteration import RowNormalization, ablate_fused_experts
-from heretic.modifiers.ara import get_fused_experts_warning
+from heretic.modifiers.ara import ARA, get_fused_experts_warning
+from heretic.modifiers.ara import Parameters as ARAParameters
+from heretic.modifiers.ara import Settings as ARASettings
 from heretic.utils import Prompt
 
 MODEL = "tiny-random/qwen3.5-moe"
@@ -281,6 +286,43 @@ class FusedAblationTests(unittest.TestCase):
         self.assertFalse(model.reset_model())
         self.assertFalse(model.has_modified_fused_experts())
 
+    def test_merge_4bit_branch_contains_modified_weights(self) -> None:
+        # The 4-bit branch reloads the base model on the CPU and copies the modified
+        # fused weights into it. It depends only on the setting, not on bitsandbytes.
+        model = get_model()
+        model.apply_lora(1)
+        handle = model.get_layer_fused_experts(2)["mlp.experts.down_proj"][0]
+        model.begin_fused_edit(handle)
+        original = model._fused_backups[handle.key].clone()
+        ablate_fused_experts(
+            handle.parameter,
+            handle.row_axis,
+            F.normalize(torch.randn(8), dim=0),
+            1.0,
+            RowNormalization.PRE,
+        )
+        modified = handle.parameter.detach().clone()
+        self.assertFalse(torch.equal(modified, original))
+
+        model.settings.quantization = QuantizationMethod.BNB_4BIT
+        try:
+            merged = model.get_merged_model()
+        finally:
+            model.settings.quantization = QuantizationMethod.NONE
+            # The model still carries the adapter and the modified fused weights,
+            # so the next test must start from a fresh load.
+            model.needs_reload = True
+
+        merged_weight = merged.model.language_model.layers[2].mlp.experts.down_proj
+        self.assertTrue(torch.equal(merged_weight.detach(), modified))
+        with tempfile.TemporaryDirectory() as directory:
+            merged.save_pretrained(directory)
+            reloaded = get_model_class(MODEL).from_pretrained(
+                directory, dtype=torch.float32
+            )
+        reloaded_weight = reloaded.model.language_model.layers[2].mlp.experts.down_proj
+        self.assertTrue(torch.equal(reloaded_weight.detach(), modified))
+
     def test_adapter_export_is_refused(self) -> None:
         model = get_model()
         handle = model.get_layer_fused_experts(0)["mlp.experts.down_proj"][0]
@@ -336,6 +378,94 @@ class ModuleIOTests(unittest.TestCase):
             self.assertEqual(tuple(module_input.shape), (3, 32))
             self.assertEqual(tuple(module_output.shape), (3, 8))
             self.assertIn("attn.o_proj", layer)
+
+    def test_get_module_io_skips_sparse_inputs_with_one_warning(self) -> None:
+        model = get_model()
+        prompts = [
+            Prompt(system="You are helpful.", user="a"),
+            Prompt(system="You are helpful.", user="bb bb"),
+            Prompt(system="You are helpful.", user="ccc ccc ccc"),
+        ]
+
+        # Make the shared expert's down projection see a single row, like a routed
+        # expert that only receives some of the tokens. Broadcasting keeps the
+        # forward pass valid.
+        handles = [
+            layer.mlp.shared_expert.down_proj.register_forward_pre_hook(
+                lambda module, args: (args[0][:1],)
+            )
+            for layer in model.get_layers()
+        ]
+        model._warnings_shown.discard("sparse-io:mlp.down_proj")
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                module_io = model.get_module_io_batched(prompts)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # Warned exactly once for the component, across all layers and batches.
+        self.assertEqual(buffer.getvalue().count("cannot be recorded"), 1)
+        for layer in module_io:
+            # The skipped component is absent rather than an empty mapping.
+            self.assertNotIn("mlp.down_proj", layer)
+            # Other components are still recorded.
+            self.assertEqual(tuple(layer["attn.o_proj"][0][0].shape[0:1]), (3,))
+
+    def test_ara_skips_modules_without_recorded_io(self) -> None:
+        model = get_model()
+        model.apply_lora(2)
+        good = [Prompt(system="s", user=u) for u in ("a", "bb bb", "ccc ccc ccc")]
+        bad = [Prompt(system="s", user=u) for u in ("d d", "eee", "ff ff ff ff")]
+
+        # The shared expert's input is sparse, so its I/O is not recorded.
+        handles = [
+            layer.mlp.shared_expert.down_proj.register_forward_pre_hook(
+                lambda module, args: (args[0][:1],)
+            )
+            for layer in model.get_layers()
+        ]
+        try:
+            with redirect_stdout(io.StringIO()):
+                good_io = model.get_module_io_batched(good)
+                bad_io = model.get_module_io_batched(bad)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        modifier = ARA.__new__(ARA)
+        model.settings.seed = 1
+        modifier.heretic_settings = model.settings
+        modifier.settings = ARASettings(lora_rank=2, n_optimization_steps=1, max_iter=2)
+        modifier.good_module_io = good_io
+        modifier.bad_module_io = bad_io
+        layer_count = len(model.get_layers())
+
+        # Must not raise a KeyError for the component without recorded I/O.
+        with redirect_stdout(io.StringIO()):
+            modifier.modify_model(
+                SimpleNamespace(get_model=lambda: model),
+                ARAParameters(0, layer_count, 0.5, 0.1, 0.5, 1),
+            )
+
+        model.settings.seed = None
+
+        # The skipped modules are untouched (LoRA B starts at zero), the others are optimized.
+        shared_b = [
+            module.lora_B["default"].weight
+            for layer_index in range(layer_count)
+            for module in model.get_layer_modules(layer_index)["mlp.down_proj"]
+        ]
+        self.assertTrue(all(not b.any() for b in shared_b))
+        other_b = [
+            module.lora_B["default"].weight
+            for layer_index in range(layer_count)
+            for component, modules in model.get_layer_modules(layer_index).items()
+            if component != "mlp.down_proj"
+            for module in modules
+        ]
+        self.assertTrue(any(b.any() for b in other_b))
 
     def test_ara_warns_about_fused_experts(self) -> None:
         warning = get_fused_experts_warning(get_model())

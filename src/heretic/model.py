@@ -1106,12 +1106,6 @@ class Model:
                 inputs: tuple[Tensor, ...],
                 outputs: Tensor,
             ) -> None:
-                if component not in module_io[layer_index]:
-                    module_io[layer_index][component] = {}
-
-                # Each module should be invoked at most once per inference step.
-                assert module_index not in module_io[layer_index][component]
-
                 # inputs[0] and outputs have shape (prompt, position, component),
                 # or (prompt * position, component) for modules in MoE blocks that are
                 # applied to the flattened hidden states. This extracts the input/output
@@ -1131,6 +1125,13 @@ class Model:
                         "Their I/O cannot be recorded and these modules are skipped.[/]",
                     )
                     return
+
+                # Only components with recorded I/O get an entry; skipped ones stay absent.
+                if component not in module_io[layer_index]:
+                    module_io[layer_index][component] = {}
+
+                # Each module should be invoked at most once per inference step.
+                assert module_index not in module_io[layer_index][component]
 
                 # Move to CPU to decouple from device assignments, which can
                 # change between model reloads in multi-GPU configurations.
