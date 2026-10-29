@@ -169,6 +169,26 @@ def obtain_export_strategy(
 
         print()
 
+    if model.has_modified_fused_experts():
+        # Fused experts are modified directly (they are 3D tensors, not Linear layers),
+        # so they cannot be represented by a LoRA adapter.
+        if settings.export_strategy == ExportStrategy.ADAPTER:
+            print()
+            print(
+                "[red]Cannot export only the LoRA adapter:[/] this model has fused routed experts "
+                "that were modified directly, and fused weights cannot be stored as a PEFT LoRA adapter. "
+                'Use export_strategy = "merge" to export the full model.'
+            )
+            return None
+
+        if settings.export_strategy is None:
+            print()
+            print(
+                "[yellow]Only merging is available, because the fused routed experts "
+                "were modified directly and cannot be stored as a LoRA adapter.[/]"
+            )
+            return ExportStrategy.MERGE
+
     return ask_if_unset(
         settings.export_strategy,
         questionary.select(

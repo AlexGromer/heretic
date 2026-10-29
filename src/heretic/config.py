@@ -274,6 +274,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    fused_experts_backup_device: str = Field(
+        default="cpu",
+        description=(
+            "Device on which to keep the original weights of fused routed experts "
+            "(models whose experts are stored as one 3D tensor per layer, e.g. Qwen3.5 MoE), "
+            "which are modified directly instead of through a LoRA adapter, and must be "
+            "restored between trials. The backups take as much memory as the modified tensors, "
+            'so the default "cpu" keeps them out of VRAM. Use e.g. "cuda:0" for faster '
+            "resets if you have spare VRAM."
+        ),
+    )
+
     batch_size: NonNegativeInt = Field(
         default=0,  # auto
         description="Number of input sequences to process in parallel (0 = auto).",

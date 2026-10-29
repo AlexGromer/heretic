@@ -22,6 +22,7 @@ from torch import Tensor
 from torch.optim import LBFGS
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
+from heretic.model import Model
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.utils import format_dataset_specification, print
 
@@ -160,6 +161,24 @@ def ara_loss(
     )
 
 
+def get_fused_experts_warning(model: Model) -> str | None:
+    """
+    Returns a warning for models with fused routed experts, or None for other models.
+    """
+    if not model.has_fused_experts():
+        return None
+
+    return (
+        "[yellow bold]WARNING: This model has fused routed experts "
+        "(one 3D weight tensor per layer instead of a Linear module per expert).[/]\n"
+        "[yellow]ARA operates on Linear modules only and leaves the routed experts unmodified; "
+        "only the attention outputs and the shared expert are ablated, "
+        "which is usually not enough to remove refusals from a MoE model. "
+        "The Abliteration modifier handles fused routed experts "
+        '(modifiers = [ { plugin = "heretic.modifiers.abliteration.Abliteration" } ]).[/]'
+    )
+
+
 class ARA(Modifier[Parameters]):
     settings: Settings
 
@@ -187,6 +206,11 @@ class ARA(Modifier[Parameters]):
         )
         bad_prompts = ctx.load_prompts(self.settings.bad_prompts)
         print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
+
+        fused_experts_warning = get_fused_experts_warning(model)
+        if fused_experts_warning is not None:
+            print()
+            print(fused_experts_warning)
 
         self.good_prompt_count = len(good_prompts)
         self.bad_prompt_count = len(bad_prompts)
@@ -265,6 +289,15 @@ class ARA(Modifier[Parameters]):
         ):
             for component, modules in model.get_layer_modules(layer_index).items():
                 for module_index, module in enumerate(modules):
+                    # Modules whose I/O could not be recorded (e.g. because they only
+                    # see some of the tokens) cannot be optimized.
+                    if module_index not in self.good_module_io[layer_index].get(
+                        component, {}
+                    ) or module_index not in self.bad_module_io[layer_index].get(
+                        component, {}
+                    ):
+                        continue
+
                     # Cast to Linear to access weights and LoRA adapters.
                     module = cast(Linear, module)
 

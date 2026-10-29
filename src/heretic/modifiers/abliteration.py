@@ -20,6 +20,7 @@ from pydantic import (
 from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
+from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.utils import format_dataset_specification, print
 
@@ -134,6 +135,81 @@ class Settings(BaseModel):
     )
 
 
+# The maximum number of elements of the temporary float32 tensors that are created
+# per chunk when modifying fused experts. A chunk of 2**26 elements takes 256 MiB
+# in float32, and a handful of those are alive at the same time.
+FUSED_CHUNK_ELEMENTS = 2**26
+
+
+def ablate_fused_experts(
+    parameter: Tensor,
+    row_axis: int,
+    v: Tensor,
+    weight: float,
+    row_normalization: RowNormalization,
+    max_chunk_elements: int = FUSED_CHUNK_ELEMENTS,
+) -> None:
+    """
+    Orthogonally ablates the direction v from the down projections of all experts
+    held in a fused 3D parameter, in place.
+
+    This applies to each expert's weight matrix W (with the hidden dimension as its rows,
+    exactly like the weight of a Linear layer) the same ablation as the LoRA path
+    does for Linear modules: W <- W - weight * v (v^T W).
+    The row normalization modes have the same semantics as there: "pre" applies
+    the ablation to the row-normalized matrix and scales the change back by the row norms,
+    "full" additionally renormalizes the rows to their original norms. Because the weights
+    are modified directly, "full" is exact here, instead of being approximated by a
+    low-rank adapter.
+
+    The experts are processed in chunks, so that only a small part of the parameter
+    is converted to float32 at any time, and the result is written back
+    to the original storage, so no second copy of the parameter is ever created.
+    """
+    assert parameter.dim() == 3 and row_axis in (1, 2)
+
+    # Put the hidden dimension on axis 1, for (expert, row, column) matrices.
+    # This is a view, so writing to it modifies the parameter.
+    matrices = parameter.data if row_axis == 1 else parameter.data.transpose(1, 2)
+
+    expert_count, row_count, column_count = matrices.shape
+    assert v.shape == (row_count,), (
+        f"Direction of shape {tuple(v.shape)} does not match "
+        f"the hidden size {row_count} of the fused experts"
+    )
+
+    v = v.to(device=parameter.device, dtype=torch.float32)
+
+    chunk_size = max(1, max_chunk_elements // (row_count * column_count))
+
+    with torch.no_grad():
+        for start in range(0, expert_count, chunk_size):
+            chunk = matrices[start : start + chunk_size]
+            W = chunk.to(torch.float32)
+
+            if row_normalization == RowNormalization.NONE:
+                # coefficients[e] = v^T W[e], with shape (column,).
+                coefficients = torch.einsum("h,ehc->ec", v, W)
+                W -= weight * torch.einsum("h,ec->ehc", v, coefficients)
+            else:
+                W_row_norms = LA.vector_norm(W, dim=2, keepdim=True)
+                W_normalized = F.normalize(W, p=2, dim=2)
+                coefficients = torch.einsum("h,ehc->ec", v, W_normalized)
+                ablated = W_normalized - weight * torch.einsum(
+                    "h,ec->ehc", v, coefficients
+                )
+
+                if row_normalization == RowNormalization.PRE:
+                    # Same as scaling the change by the row norms: W + norms * (ablated - W_normalized).
+                    W += W_row_norms * (ablated - W_normalized)
+                else:
+                    # Normalize the adjusted matrix along the rows, then restore
+                    # the original row norms.
+                    W = F.normalize(ablated, p=2, dim=2) * W_row_norms
+
+            chunk.copy_(W.to(chunk.dtype))
+
+
 class Abliteration(Modifier[Parameters]):
     settings: Settings
 
@@ -219,6 +295,14 @@ class Abliteration(Modifier[Parameters]):
         else:
             # Row magnitude preservation introduces nonlinear effects.
             self.lora_rank = self.settings.full_normalization_lora_rank
+
+        if model.has_fused_experts():
+            print()
+            print(
+                "* Fused routed experts found. They are ablated by modifying their weights "
+                "directly (using the parameters of [bold]mlp.down_proj[/]), "
+                "which requires merging when exporting."
+            )
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -325,38 +409,72 @@ class Abliteration(Modifier[Parameters]):
                 dim=0,
             )
 
+        def get_layer_weight(layer_index: int, component: str) -> float | None:
+            # Returns the weight of the ablation of the component in the layer,
+            # or None if the component is not to be ablated in that layer.
+            weight_distribution = parameters.weight_distributions[component]
+
+            # Type inference fails here for some reason.
+            distance = abs(layer_index - weight_distribution.max_weight_position)
+
+            # Don't orthogonalize layers that are more than
+            # min_weight_distance away from max_weight_position.
+            if distance > weight_distribution.min_weight_distance:
+                return None
+
+            # Interpolate linearly between max_weight and min_weight
+            # over min_weight_distance.
+            weight = weight_distribution.max_weight + (
+                distance / weight_distribution.min_weight_distance
+            ) * (weight_distribution.min_weight - weight_distribution.max_weight)
+
+            # A weight of 0 disables this component's ablation. reset_model() has
+            # already left the adapter at identity, so abort before the otherwise
+            # wasteful decomposition (which would also be operating on a zero matrix).
+            if weight == 0:
+                return None
+
+            return weight
+
+        def get_layer_residual_direction(layer_index: int) -> Tensor:
+            if residual_direction is None:
+                # The index must be shifted by 1 because the first element
+                # of residual_directions is the direction for the embeddings.
+                return self.residual_directions[layer_index + 1]
+            else:
+                return residual_direction
+
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(model.get_layers())):
+            # Fused routed experts (Transformers v5) are no LoRA targets, so they
+            # are ablated by modifying their weights directly. They use the parameters
+            # of the "mlp.down_proj" component, so the search space is the same
+            # as for models with separate experts.
+            for fused_list in model.get_layer_fused_experts(layer_index).values():
+                weight = get_layer_weight(layer_index, FUSED_EXPERTS_WEIGHT_COMPONENT)
+
+                if weight is None:
+                    continue
+
+                for fused in fused_list:
+                    # Keeps the original weights, so reset_model can restore them.
+                    model.begin_fused_edit(fused)
+                    ablate_fused_experts(
+                        fused.parameter,
+                        fused.row_axis,
+                        get_layer_residual_direction(layer_index),
+                        weight,
+                        self.settings.row_normalization,
+                    )
+
             for component, modules in model.get_layer_modules(layer_index).items():
-                weight_distribution = parameters.weight_distributions[component]
+                weight = get_layer_weight(layer_index, component)
 
-                # Type inference fails here for some reason.
-                distance = abs(layer_index - weight_distribution.max_weight_position)
-
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
-                if distance > weight_distribution.min_weight_distance:
+                if weight is None:
                     continue
 
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
-                weight = weight_distribution.max_weight + (
-                    distance / weight_distribution.min_weight_distance
-                ) * (weight_distribution.min_weight - weight_distribution.max_weight)
-
-                # A weight of 0 disables this component's ablation. reset_model() has
-                # already left the adapter at identity, so abort before the otherwise
-                # wasteful decomposition (which would also be operating on a zero matrix).
-                if weight == 0:
-                    continue
-
-                if residual_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of residual_directions is the direction for the embeddings.
-                    layer_residual_direction = self.residual_directions[layer_index + 1]
-                else:
-                    layer_residual_direction = residual_direction
+                layer_residual_direction = get_layer_residual_direction(layer_index)
 
                 for module in modules:
                     # FIXME: This cast is potentially invalid, because the program logic
