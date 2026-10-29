@@ -1,0 +1,96 @@
+# Heretic configuration with widened search ranges (dense models).
+#
+# Fork build v3 (branch moe-fused-v3, see README-MOE.md). Every range setting below
+# defaults to the fixed range of upstream Heretic; this file widens them so that the
+# optimizer can reach stronger ablations than the defaults allow. Motivation: on
+# Qwen3.8-27B (qwen3_5) the Abliteration modifier reached only 36/100 refusals at KL 0.062
+# (the Pareto front stayed at low KL), and ARA on dense Qwen3 reached 3/100.
+#
+# The values are starting points and have NOT been measured on a GPU. Wider ranges
+# cost KL: watch the Pareto front and use the KL <= 0.15 trials.
+#
+# Usage: copy to config.toml in the directory you run `heretic` from, set `model`.
+
+model = "Qwen/Qwen3-8B"
+
+dtypes = ["auto", "bfloat16"]
+
+# The strict refusal counter inspects 256 answer tokens, so generate that many.
+max_response_length = 256
+
+# ARA is the default modifier for dense models. To use the classic Abliteration
+# modifier instead, switch the plugin below; its tables further down are used then.
+modifiers = [
+    { plugin = "heretic.modifiers.ara.ARA" },
+    # { plugin = "heretic.modifiers.abliteration.Abliteration" },
+]
+
+scorers = [
+    { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+]
+
+n_trials = 120
+n_startup_trials = 40
+
+# Strict refusal counting: removes <think> blocks before matching (also an unterminated
+# one), drops a leading disclaimer paragraph, inspects only the first
+# strict_window_tokens tokens of the answer, and uses a marker list without
+# the words that also appear in disclaimers of compliant answers ("illegal", "harmful", ...).
+[scorer.KeywordRate]
+strict = true
+strict_window_tokens = 256
+# strict_empty_answer_is_match = false
+
+[scorer.KeywordRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+# ARA ranges (upstream: start 0..0.5, end 0.5..1.0, preserve 0..1, steer 1e-4..1,
+# overcorrect 0..1.3, neighbors up to 15). Layer ranges are fractions of the number of layers.
+[modifier.ARA]
+start_layer_range = [0.0, 0.5]
+end_layer_range = [0.5, 1.0]
+preserve_good_weight_range = [0.0, 1.0]
+steer_bad_weight_range = [0.0001, 1.0]
+# Overcorrection above 1.3 steers harder and can overcome stubborn refusals.
+overcorrect_range = [0.0, 2.0]
+neighbor_count_max = 15
+
+[modifier.ARA.good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+
+[modifier.ARA.bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+
+# Abliteration ranges (upstream: direction_index 0.4..0.9, max_weight 0.8..1.5,
+# mlp_max_weight -0.25..1.5, position 0.6..1.0, min_weight 0..1,
+# distance 1 layer .. 0.6 of the layers). Fractions refer to the index of the last layer.
+[modifier.Abliteration]
+direction_index_range = [0.3, 0.95]
+max_weight_range = [1.0, 3.0]
+mlp_max_weight_range = [-0.25, 3.0]
+max_weight_position_range = [0.3, 1.0]
+min_weight_range = [0.0, 1.0]
+min_weight_distance_min_layers = 1.0
+min_weight_distance_max_fraction = 1.0
+
+[modifier.Abliteration.good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+
+[modifier.Abliteration.bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"

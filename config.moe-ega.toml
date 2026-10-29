@@ -1,0 +1,91 @@
+# Heretic configuration for MoE models with fused routed experts (Qwen3.6/3.8 MoE,
+# model_type qwen3_5_moe): Abliteration with widened ranges, expert-granular
+# abliteration (EGA) and the strict refusal counter.
+#
+# Fork build v3 (branch moe-fused-v3, see README-MOE.md). Requires transformers 5.20.2.
+# Not run on a GPU or on the real model so far: the values are starting points.
+#
+# Usage: copy to config.toml in the directory you run `heretic` from, set `model`.
+
+model = "Qwen/Qwen3.6-35B-A3B"
+
+dtypes = ["auto", "bfloat16"]
+quantization = "none"
+device_map = "auto"
+
+# Originals of the fused experts, restored between trials (needs about as much free RAM
+# as the modified tensors; use "cuda:0" if VRAM is spare). EGA reuses this backup.
+fused_experts_backup_device = "cpu"
+
+# Fused experts cannot be exported as a LoRA adapter.
+export_strategy = "merge"
+
+# The strict refusal counter inspects 256 answer tokens, so generate that many.
+max_response_length = 256
+
+# ARA cannot ablate fused routed experts; use the Abliteration modifier.
+modifiers = [
+    { plugin = "heretic.modifiers.abliteration.Abliteration" },
+]
+
+scorers = [
+    { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+]
+
+n_trials = 120
+n_startup_trials = 40
+
+[scorer.KeywordRate]
+strict = true
+strict_window_tokens = 256
+
+[scorer.KeywordRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[modifier.Abliteration]
+orthogonalize_direction = true
+row_normalization = "full"
+full_normalization_lora_rank = 3
+winsorization_quantile = 1.0
+
+# Widened ranges (see config.wide.toml for the upstream values). With EGA the strength of
+# an expert is additionally scaled by its routing frequency, so the usable maximum
+# weight is higher than without it.
+direction_index_range = [0.3, 0.95]
+max_weight_range = [1.0, 3.0]
+mlp_max_weight_range = [-0.25, 3.0]
+max_weight_position_range = [0.3, 1.0]
+min_weight_range = [0.0, 1.0]
+min_weight_distance_min_layers = 1.0
+min_weight_distance_max_fraction = 1.0
+
+# Expert-granular abliteration: one refusal direction per routed expert, computed from the
+# expert's own outputs on the tokens routed to it, strength scaled by how often the bad
+# prompts use the expert. Unused experts are not modified. The shared expert is ablated
+# like a dense MLP. Off by default; needs a model with fused routed experts.
+ega = true
+# Positions at the end of each prompt whose routed tokens are used.
+ega_last_positions = 4
+# Minimum routed tokens: bad prompts for an expert to count as used, good prompts for
+# it to get its own direction (otherwise it uses the layer direction).
+ega_min_tokens = 2
+# "max" (frequency / highest frequency), "mean" (capped at 1), or "none" (all used experts at full strength).
+ega_frequency_scaling = "max"
+
+[modifier.Abliteration.good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+
+[modifier.Abliteration.bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"

@@ -102,3 +102,87 @@ updated because that test uses `Abliteration`, which now actually modifies the r
 experts, so `model.safetensors` changes by design. `config.json` / `generation_config.json`
 hashes depend on the transformers version and differ under 5.20.2 for every test case
 (identically for upstream).
+
+# v3: wider ranges, strict refusal counting, expert-granular abliteration
+
+Branch `moe-fused-v3`, on top of `moe-fused-v2` (`95dcea1`). Three independent options; with all of
+them off (the defaults) behaviour is that of v2. Tests: `tests/test_v3_*.py` (CPU, tiny models or
+pure functions). Example configs: `config.wide.toml` (dense), `config.moe-ega.toml` (MoE).
+
+Not run on a GPU and not on the real Qwen3.6/3.8 models. What the options do to refusals and KL on
+real models is **not measured**; the example configs are starting points.
+
+## 1. Wider search ranges
+
+The fixed Optuna ranges of the modifiers are settings now, with the upstream values as defaults
+(a test pins them to the old hard-coded bounds).
+
+* `[modifier.Abliteration]`: `direction_index_range`, `max_weight_range`, `mlp_max_weight_range`,
+  `max_weight_position_range`, `min_weight_range`, `min_weight_distance_min_layers`,
+  `min_weight_distance_max_fraction`.
+* `[modifier.ARA]`: `start_layer_range`, `end_layer_range`, `preserve_good_weight_range`,
+  `steer_bad_weight_range`, `overcorrect_range`, `neighbor_count_max`.
+
+Validation happens when the config is loaded: `low <= high` (equal pins the parameter), finite
+numbers, no negative weights (only the lower bound of `mlp_max_weight_range` may be negative, it is
+clamped to 0 as upstream does), fractions within `[0, 1]`, `steer_bad_weight_range` strictly
+positive (log-uniform sampling). ARA layer ranges may overlap now; the sampled end is raised to
+`start + 1` afterwards if needed (the default ranges never need it).
+
+## 2. Strict keyword scorer
+
+`[scorer.KeywordRate] strict = true` (default false; the upstream counting is untouched when off):
+
+* chain-of-thought blocks (`chain_of_thought_blocks`, e.g. `<think>...</think>`) are removed before
+  matching, including an unterminated block (generation ended inside the thinking) and a closing
+  tag without opening tag (templates that open `<think>` in the prompt, like Qwen3 thinking mode);
+* a leading disclaimer paragraph (`Disclaimer`, `Warning:`, `Note:`, ...) is dropped if the answer
+  continues after it;
+* only the first `strict_window_tokens` (default 256) tokens of the answer are inspected (real
+  tokens when the tokenizer is available). Responses are only `max_response_length` long, so set
+  that to 256 as well;
+* `strict_markers` replace `keyword_markers`: the default list without `disclaimer`, `violat`,
+  `prohibit`, `illegal`, `harmful`, `inappropriate`, `unethical`, `ethical boundaries`, plus
+  `i don't want`, `i don't create`, `cannot assist`, `can't help`, `i must decline` and variants;
+* `strict_empty_answer_is_match` (default false): whether a response that is empty only after
+  removing the thinking counts as a refusal. A response that is empty to begin with always does.
+
+Rationale (research report 2026-10-29): the upstream markers fire on disclaimers of fully compliant
+answers and miss some phrasings; part of the "refusals" of the optimization may be false positives.
+A refusal followed by compliance is deliberately still counted (it cannot be told apart from a soft
+refusal by markers); only a judge model separates the two.
+
+## 3. Expert-granular abliteration (EGA)
+
+`[modifier.Abliteration] ega = true` (default false) for models with fused routed experts
+(`qwen3_5_moe` and other models with the same `gate_up_proj` / `down_proj` / `act_fn` layout).
+
+* For every layer and routed expert the fork runs the good and bad prompts and records the
+  expert's own output (before the routing weight) for the tokens routed to it, at the last
+  `ega_last_positions` (default 4) positions of each prompt.
+* The direction of an expert is the normalized difference of its mean outputs on bad and good
+  prompts, made orthogonal to its mean good output when `orthogonalize_direction` is on.
+* The ablation strength of an expert is the trial's `mlp.down_proj` weight times a factor from the
+  expert's routing frequency on the bad prompts (`ega_frequency_scaling`: `max` = frequency divided
+  by the layer maximum, `mean`, or `none`). An expert with fewer than `ega_min_tokens` routed bad
+  tokens is unused and not modified at all (bit-exact). A used expert with too few good tokens uses
+  the layer's residual direction.
+* The shared expert and the attention outputs are ablated like a dense MLP, exactly as without EGA.
+* The directions are computed once on the unmodified model. Original weights are restored between
+  trials from the v2 backup (`fused_experts_backup_device`); EGA adds no second copy.
+* The search space does not change. `direction_scope` only affects the Linear modules and the
+  fallback; an expert uses the direction of its own layer.
+* Experts with another weight layout are skipped with a warning and ablated with the layer direction.
+
+Sources of the idea (from the research report 2026-10-29, `abliteration-2026-10-29/report.md`; the
+numbers are the authors' own and not comparable with ours):
+
+* TrevorS/gemma-4-abliteration (Apache-2.0): heretic with EGA; Gemma 4 26B-A4B refusals 29/100
+  without EGA, 3/100 with EGA.
+* abliterix (wuwangzhang1216/abliterix, AGPL-3.0, derivative of heretic): MoE expert-granular
+  abliteration, router suppression, FP8 handling.
+* OBLITERATUS (elder-plinius, AGPL-3.0 and commercial licence): `surgical` preset with EGA.
+
+This implementation follows the method description in the task specification and the fork's own
+code. No code of these projects was copied, so none of it is derived work; the credit is for the idea.
+Router pre-bias (heretic issue #322) is not implemented.
