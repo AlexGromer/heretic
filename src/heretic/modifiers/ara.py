@@ -17,6 +17,8 @@ from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
+    ValidationInfo,
+    field_validator,
 )
 from torch import Tensor
 from torch.optim import LBFGS
@@ -24,6 +26,7 @@ from torch.optim import LBFGS
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.model import Model
 from heretic.modifier import Context, Modifier, Serializable
+from heretic.ranges import check_range, scaled_floor
 from heretic.utils import format_dataset_specification, print
 
 
@@ -112,6 +115,79 @@ class Settings(BaseModel):
         default=False,
         description="Whether to print the loss value for each L-BFGS optimization step.",
     )
+
+    # Search ranges (fork addition). The defaults are the fixed ranges of upstream Heretic;
+    # widen them to let the optimizer explore stronger steering.
+    start_layer_range: tuple[float, float] = Field(
+        default=(0.0, 0.5),
+        description=(
+            "Range of the first modified layer, as fractions of the number of layers."
+        ),
+    )
+
+    end_layer_range: tuple[float, float] = Field(
+        default=(0.5, 1.0),
+        description=(
+            "Range of the end (exclusive) of the modified layers, as fractions of the number "
+            "of layers. The lowest sampled end is floor(lower * layers) + 1. "
+            "If the sampled end does not exceed the sampled start (possible only when "
+            "the two ranges overlap), it is raised to start + 1."
+        ),
+    )
+
+    preserve_good_weight_range: tuple[float, float] = Field(
+        default=(0.0, 1.0),
+        description="Range of the weight of the term that preserves the outputs for good prompts.",
+    )
+
+    steer_bad_weight_range: tuple[float, float] = Field(
+        default=(0.0001, 1.0),
+        description=(
+            "Range of the weight of the term that steers the outputs for bad prompts "
+            "(sampled log-uniformly, so the lower bound must be positive)."
+        ),
+    )
+
+    overcorrect_range: tuple[float, float] = Field(
+        default=(0.0, 1.3),
+        description=(
+            "Range of the relative weight of the overcorrection (pushing bad outputs "
+            "away from their original position). Values above 1.3 steer more strongly "
+            "but can damage the model."
+        ),
+    )
+
+    neighbor_count_max: PositiveInt = Field(
+        default=15,
+        description=(
+            "Upper bound of the number of nearest neighbors "
+            "(also limited by the number of prompts)."
+        ),
+    )
+
+    @field_validator(
+        "start_layer_range",
+        "end_layer_range",
+    )
+    @classmethod
+    def validate_layer_ranges(
+        cls, value: tuple[float, float], info: ValidationInfo
+    ) -> tuple[float, float]:
+        return check_range(info.field_name, value, lower_limit=0.0, upper_limit=1.0)
+
+    @field_validator("preserve_good_weight_range", "overcorrect_range")
+    @classmethod
+    def validate_weight_ranges(
+        cls, value: tuple[float, float], info: ValidationInfo
+    ) -> tuple[float, float]:
+        return check_range(info.field_name, value, lower_limit=0.0)
+
+    @field_validator("steer_bad_weight_range")
+    @classmethod
+    def validate_steer_bad_weight_range(
+        cls, value: tuple[float, float]
+    ) -> tuple[float, float]:
+        return check_range("steer_bad_weight_range", value, strictly_positive=True)
 
 
 # For each vector in the 2D-tensor `a`, computes the mean Euclidean distance
@@ -232,38 +308,63 @@ class ARA(Modifier[Parameters]):
 
         start_layer_index = trial.suggest_int(
             "start_layer_index",
-            0,
-            layer_count // 2,
+            min(
+                scaled_floor(self.settings.start_layer_range[0], layer_count),
+                layer_count - 1,
+            ),
+            # At least one layer must remain after the start.
+            min(
+                scaled_floor(self.settings.start_layer_range[1], layer_count),
+                layer_count - 1,
+            ),
         )
-        # The end index is exclusive, so starting its range one above the start range's
-        # upper bound ensures that the layer range is never empty.
+        # The end index is exclusive, so starting its range one above the lower bound
+        # (the start range's upper bound in the default configuration) ensures that
+        # the layer range is never empty.
         end_layer_index = trial.suggest_int(
             "end_layer_index",
-            layer_count // 2 + 1,
-            layer_count,
+            min(
+                scaled_floor(self.settings.end_layer_range[0], layer_count) + 1,
+                layer_count,
+            ),
+            max(
+                scaled_floor(self.settings.end_layer_range[1], layer_count),
+                min(
+                    scaled_floor(self.settings.end_layer_range[0], layer_count) + 1,
+                    layer_count,
+                ),
+            ),
         )
+        # With overlapping ranges, the sampled end can fall at or below the start.
+        # Raise it afterwards (instead of using a conditional range, which
+        # multivariate TPE does not support). Never triggers with the defaults.
+        end_layer_index = min(max(end_layer_index, start_layer_index + 1), layer_count)
         preserve_good_behavior_weight = trial.suggest_float(
             "preserve_good_behavior_weight",
-            0.0,
-            1.0,
+            self.settings.preserve_good_weight_range[0],
+            self.settings.preserve_good_weight_range[1],
         )
         steer_bad_behavior_weight = trial.suggest_float(
             "steer_bad_behavior_weight",
-            0.0001,
-            1.0,
+            self.settings.steer_bad_weight_range[0],
+            self.settings.steer_bad_weight_range[1],
             log=True,
         )
         overcorrect_relative_weight = trial.suggest_float(
             "overcorrect_relative_weight",
-            0.0,
-            1.3,
+            self.settings.overcorrect_range[0],
+            self.settings.overcorrect_range[1],
         )
         # The nearest neighbors are selected from the outputs for the good and bad prompts,
         # which contain one vector per prompt, so there can't be more neighbors than prompts.
         neighbor_count = trial.suggest_int(
             "neighbor_count",
             1,
-            min(15, self.good_prompt_count, self.bad_prompt_count),
+            min(
+                self.settings.neighbor_count_max,
+                self.good_prompt_count,
+                self.bad_prompt_count,
+            ),
         )
 
         return Parameters(

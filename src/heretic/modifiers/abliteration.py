@@ -16,12 +16,21 @@ from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
+    ValidationInfo,
+    field_validator,
 )
 from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
+from heretic.ega import (
+    EgaPlan,
+    FrequencyScaling,
+    ablate_fused_experts_per_expert,
+    build_ega_plans,
+)
 from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT
 from heretic.modifier import Context, Modifier, Serializable
+from heretic.ranges import check_range
 from heretic.utils import format_dataset_specification, print
 
 
@@ -131,6 +140,133 @@ class Settings(BaseModel):
             'This can tame so-called "massive activations" that occur in some models. '
             "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
             "of the components, then clamps the magnitudes of all components to that quantile."
+        ),
+    )
+
+    # Search ranges (fork addition). The defaults are the fixed ranges of upstream Heretic;
+    # widen them to let the optimizer explore stronger or more spread-out ablations.
+    direction_index_range: tuple[float, float] = Field(
+        default=(0.4, 0.9),
+        description=(
+            "Range of the global direction index, as fractions of the index of the last layer."
+        ),
+    )
+
+    max_weight_range: tuple[float, float] = Field(
+        default=(0.8, 1.5),
+        description="Range of the maximum ablation weight of the attention output.",
+    )
+
+    mlp_max_weight_range: tuple[float, float] = Field(
+        default=(-0.25, 1.5),
+        description=(
+            "Range of the maximum ablation weight of the MLP / fused experts. "
+            "A negative lower bound is clamped to 0 after sampling, so the optimizer "
+            "can disable the MLP ablation entirely."
+        ),
+    )
+
+    max_weight_position_range: tuple[float, float] = Field(
+        default=(0.6, 1.0),
+        description=(
+            "Range of the position of the maximum weight, "
+            "as fractions of the index of the last layer."
+        ),
+    )
+
+    min_weight_range: tuple[float, float] = Field(
+        default=(0.0, 1.0),
+        description="Range of the minimum weight, as a fraction of the maximum weight.",
+    )
+
+    min_weight_distance_min_layers: float = Field(
+        default=1.0,
+        description="Lower bound of the distance (in layers) over which the weight falls from max to min.",
+    )
+
+    min_weight_distance_max_fraction: float = Field(
+        default=0.6,
+        description=(
+            "Upper bound of that distance, as a fraction of the index of the last layer "
+            "(may exceed 1 to let the ablation span the whole layer stack)."
+        ),
+    )
+
+    @field_validator("direction_index_range", "max_weight_position_range")
+    @classmethod
+    def validate_fraction_ranges(
+        cls, value: tuple[float, float], info: ValidationInfo
+    ) -> tuple[float, float]:
+        return check_range(info.field_name, value, lower_limit=0.0, upper_limit=1.0)
+
+    @field_validator("max_weight_range", "min_weight_range")
+    @classmethod
+    def validate_non_negative_ranges(
+        cls, value: tuple[float, float], info: ValidationInfo
+    ) -> tuple[float, float]:
+        upper_limit = 1.0 if info.field_name == "min_weight_range" else None
+        return check_range(
+            info.field_name, value, lower_limit=0.0, upper_limit=upper_limit
+        )
+
+    @field_validator("mlp_max_weight_range")
+    @classmethod
+    def validate_mlp_max_weight_range(
+        cls, value: tuple[float, float]
+    ) -> tuple[float, float]:
+        # The lower bound may be negative (it is clamped to 0), but the upper
+        # bound must be a real, non-negative weight.
+        check_range("mlp_max_weight_range", value, lower_limit=None)
+        if value[1] < 0:
+            raise ValueError(
+                f"mlp_max_weight_range: upper bound {value[1]} must not be negative"
+            )
+        return value
+
+    @field_validator(
+        "min_weight_distance_min_layers", "min_weight_distance_max_fraction"
+    )
+    @classmethod
+    def validate_positive(cls, value: float, info: ValidationInfo) -> float:
+        check_range(info.field_name, (value, value), strictly_positive=True)
+        return value
+
+    ega: bool = Field(
+        default=False,
+        description=(
+            "Expert-granular abliteration for models with fused routed experts: every expert "
+            "gets its own refusal direction, computed from its own outputs on the routed "
+            "tokens of the good and bad prompts, and a strength scaled by how often "
+            "bad prompts use it. Experts that bad prompts do not use are left untouched. "
+            "The shared expert is ablated like a dense MLP. Has no effect on models "
+            "without fused experts."
+        ),
+    )
+
+    ega_last_positions: PositiveInt = Field(
+        default=4,
+        description=(
+            "Number of positions at the end of each prompt (where the model decides "
+            "whether to refuse) whose routed tokens are used for the per-expert directions."
+        ),
+    )
+
+    ega_min_tokens: PositiveInt = Field(
+        default=2,
+        description=(
+            "Minimum number of routed bad-prompt tokens for an expert to count as used "
+            "(otherwise it is not modified), and of good-prompt tokens for it to get "
+            "its own direction (otherwise the layer direction is used)."
+        ),
+    )
+
+    ega_frequency_scaling: FrequencyScaling = Field(
+        default=FrequencyScaling.MAX,
+        description=(
+            "How the strength of an expert depends on its routing frequency on bad prompts. "
+            '"max": frequency divided by the highest frequency in the layer; '
+            '"mean": frequency divided by the mean frequency of the used experts, capped at 1; '
+            '"none": every used expert gets the full strength.'
         ),
     )
 
@@ -304,6 +440,36 @@ class Abliteration(Modifier[Parameters]):
                 "which requires merging when exporting."
             )
 
+        self.ega_plans: dict[tuple[int, str], EgaPlan] = {}
+
+        if self.settings.ega:
+            if not model.has_fused_experts():
+                print()
+                print(
+                    "[yellow]WARNING: ega = true, but the model has no fused routed experts; "
+                    "expert-granular abliteration has no effect.[/]"
+                )
+            else:
+                print()
+                print(
+                    "Calculating per-expert directions (expert-granular abliteration)..."
+                )
+                self.ega_plans = build_ega_plans(
+                    model,
+                    good_prompts,
+                    bad_prompts,
+                    last_positions=self.settings.ega_last_positions,
+                    min_tokens=self.settings.ega_min_tokens,
+                    orthogonalize=self.settings.orthogonalize_direction,
+                    frequency_scaling=self.settings.ega_frequency_scaling,
+                )
+                for (layer_index, path), plan in sorted(self.ega_plans.items()):
+                    print(
+                        f"* Layer {layer_index} [bold]{path}[/]: "
+                        f"{len(plan.used_experts())} of {plan.scales.shape[0]} experts "
+                        f"used by bad prompts, {int(plan.fallback.sum())} with layer direction"
+                    )
+
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
         model.apply_lora(self.lora_rank)
@@ -330,8 +496,8 @@ class Abliteration(Modifier[Parameters]):
         # work with conditional or variable-range parameters.
         direction_index = trial.suggest_float(
             "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
+            self.settings.direction_index_range[0] * last_layer_index,
+            self.settings.direction_index_range[1] * last_layer_index,
         )
 
         if direction_scope == "per layer":
@@ -351,32 +517,41 @@ class Abliteration(Modifier[Parameters]):
             # removing refusals and tends to damage model intelligence more than
             # ablating the attention output, so on many models the optimum is to leave
             # it (mostly) untouched. See issue #202.
-            max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+            #
+            # The ranges are configurable (see Settings); the defaults are the ranges above.
+            max_weight_range = (
+                self.settings.mlp_max_weight_range
+                if component == "mlp.down_proj"
+                else self.settings.max_weight_range
+            )
             max_weight = max(
                 0.0,
                 trial.suggest_float(
                     f"{component}.max_weight",
-                    max_weight_lower_bound,
-                    1.5,
+                    max_weight_range[0],
+                    max_weight_range[1],
                 ),
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
+                self.settings.max_weight_position_range[0] * last_layer_index,
+                self.settings.max_weight_position_range[1] * last_layer_index,
             )
             # For sampling purposes, min_weight is expressed as a fraction of max_weight,
             # again because multivariate TPE doesn't support variable-range parameters.
             # The value is transformed into the actual min_weight value below.
             min_weight = trial.suggest_float(
                 f"{component}.min_weight",
-                0.0,
-                1.0,
+                self.settings.min_weight_range[0],
+                self.settings.min_weight_range[1],
             )
             min_weight_distance = trial.suggest_float(
                 f"{component}.min_weight_distance",
-                1.0,
-                max(0.6 * last_layer_index, 1.0),
+                self.settings.min_weight_distance_min_layers,
+                max(
+                    self.settings.min_weight_distance_max_fraction * last_layer_index,
+                    self.settings.min_weight_distance_min_layers,
+                ),
             )
 
             weight_distributions[component] = WeightDistribution(
@@ -460,11 +635,30 @@ class Abliteration(Modifier[Parameters]):
                 for fused in fused_list:
                     # Keeps the original weights, so reset_model can restore them.
                     model.begin_fused_edit(fused)
-                    ablate_fused_experts(
+
+                    plan = self.ega_plans.get(fused.key) if self.settings.ega else None
+
+                    if plan is None:
+                        ablate_fused_experts(
+                            fused.parameter,
+                            fused.row_axis,
+                            get_layer_residual_direction(layer_index),
+                            weight,
+                            self.settings.row_normalization,
+                        )
+                        continue
+
+                    # Expert-granular: own direction and strength per expert; experts
+                    # without enough data of their own use the layer direction.
+                    directions = plan.directions.clone()
+                    directions[plan.fallback] = get_layer_residual_direction(
+                        layer_index
+                    ).to(device="cpu", dtype=directions.dtype)
+                    ablate_fused_experts_per_expert(
                         fused.parameter,
                         fused.row_axis,
-                        get_layer_residual_direction(layer_index),
-                        weight,
+                        directions,
+                        plan.scales * weight,
                         self.settings.row_normalization,
                     )
 
