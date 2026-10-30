@@ -419,10 +419,10 @@ PARTIAL is a hypothesis: measure judge rates, KL and GSM8K.
   answers cut at the token limit, `generate_colab.py --system-prompt-file` for an
   authorized-pentest system prompt.
 
-# Colab handoff (branch `colab-handoff`)
+# Handing ranked trials to an external judge (branch `colab-handoff`)
 
-For the Colab pipeline, where the judge (`refusal-eval/judge_colab.py`) runs in its own process and
-must not share the GPU with the evaluated model:
+For setups where the judge runs in its own process and must not share the GPU with the evaluated
+model (e.g. `refusal-eval/judge_colab.py`); how a pipeline uses this is the pipeline's business:
 
 * `judge_ranking_mode = "generate"`: after the optimization, Heretic writes the answers of the
   original model (`trial` "base") and of the best `n_judge_ranking_trials` trials within
@@ -439,8 +439,6 @@ must not share the GPU with the evaluated model:
 * Ranking on a refusal-eval evaluation hold-out (`data/offsec_holdout*.jsonl`, `harmless*.jsonl`,
   the v3 monitor files) prints a warning: rank on a validation set such as `train/bad_eval` and keep
   the hold-out for the final measurement of the selected trial.
-* Intended use in the pipeline: a cheap first stage (rank ~8 trials on `bad_eval`, judge, keep 2-3),
-  then the existing exact stage (export those and measure them on the hold-out).
 * `--trial-number N` selects the trial shown as `[Trial N]` (the `trial` field of the rows), from
   all completed trials, independent of the menu order; `--trial-index` still counts menu positions.
 * Colab configs (paths, Drive layout, the two-run recipe) belong to heretic-colab-pipeline, which
