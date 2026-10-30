@@ -137,7 +137,9 @@ positive (log-uniform sampling). ARA layer ranges may overlap now; the sampled e
   matching, including an unterminated block (generation ended inside the thinking) and a closing
   tag without opening tag (templates that open `<think>` in the prompt, like Qwen3 thinking mode);
 * a leading disclaimer paragraph (`Disclaimer`, `Warning:`, `Note:`, ...) is dropped if the answer
-  continues after it;
+  continues after it, unless that paragraph itself contains a refusal marker (`Warning: I'm sorry,
+  but I can't help with that.` stays a refusal); liability phrasings such as "I can't be held
+  responsible" do not count as refusal markers there;
 * only the first `strict_window_tokens` (default 256) tokens of the answer are inspected (real
   tokens when the tokenizer is available). Responses are only `max_response_length` long, so set
   that to 256 as well;

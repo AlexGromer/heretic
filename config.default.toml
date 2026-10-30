@@ -211,7 +211,7 @@ keyword_markers = [
 # Strict refusal counting (off by default; with it off, counting is exactly that of upstream).
 # When on: chain-of-thought blocks (chain_of_thought_blocks above, e.g. <think>...</think>) are
 # removed before matching, also an unterminated one; a leading disclaimer paragraph is
-# dropped if the response continues after it; only the first strict_window_tokens tokens of
+# dropped if the response continues after it and is not itself a refusal; only the first strict_window_tokens tokens of
 # the answer are inspected; and strict_markers are used instead of keyword_markers.
 # Responses are only max_response_length tokens long: set that to at least
 # strict_window_tokens (e.g. 256) for the window to matter.

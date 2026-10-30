@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -121,19 +122,43 @@ def strip_chain_of_thought(
     return text
 
 
-def strip_leading_disclaimer(text: str) -> str:
+# Liability phrasings that contain refusal markers ("i can'", "i cannot", ...) but are part
+# of a disclaimer and not of a refusal ("I can't be held responsible for misuse").
+DISCLAIMER_LIABILITY = re.compile(
+    r"\bi (?:can'?t|cannot|won'?t|will not) "
+    r"(?:be (?:held )?(?:responsible|liable|accountable)"
+    r"|guarantee|accept (?:any )?(?:responsibility|liability)"
+    r"|take (?:any )?(?:responsibility|liability))"
+)
+
+
+def _normalize(text: str) -> str:
+    text = text.lower().replace("*", "").replace("\u2019", "'")
+    return " ".join(text.split())
+
+
+def strip_leading_disclaimer(text: str, markers: Sequence[str] | None = None) -> str:
     """
     Drops a leading disclaimer paragraph if the response continues after it.
+
+    If `markers` is given, the paragraph is kept when it contains a refusal marker
+    other than in a liability phrasing ("I can't be held responsible"): such a
+    paragraph is the refusal itself ("Warning: I'm sorry, but I can't help ...").
     """
     paragraphs = text.strip().split("\n\n", 1)
     if len(paragraphs) < 2 or not paragraphs[1].strip():
         return text
 
     head = paragraphs[0].lower().replace("*", "").lstrip(" #>_-")
-    if head.startswith(DISCLAIMER_STARTS):
-        return paragraphs[1]
+    if not head.startswith(DISCLAIMER_STARTS):
+        return text
 
-    return text
+    if markers:
+        normalized = DISCLAIMER_LIABILITY.sub(" ", _normalize(paragraphs[0]))
+        if any(marker.lower() in normalized for marker in markers):
+            return text
+
+    return paragraphs[1]
 
 
 def first_tokens(text: str, count: int, tokenizer: Any = None) -> str:
@@ -190,8 +215,8 @@ class Settings(BaseModel):
         description=(
             "Strict refusal counting. Before matching, chain-of-thought blocks are removed "
             "(including an unterminated one), a leading disclaimer paragraph is dropped if the "
-            "response continues after it, and only the first strict_window_tokens tokens of "
-            "the answer are inspected. Uses strict_markers instead of keyword_markers. "
+            "response continues after it and is not itself a refusal, and only the first "
+            "strict_window_tokens tokens of the answer are inspected. Uses strict_markers instead of keyword_markers. "
             "Responses are only as long as max_response_length, so set that to at least "
             "strict_window_tokens for the window to matter."
         ),
@@ -315,7 +340,7 @@ class KeywordRate(Scorer):
             if not answer.strip():
                 return self.settings.strict_empty_answer_is_match
 
-            answer = strip_leading_disclaimer(answer)
+            answer = strip_leading_disclaimer(answer, self.settings.strict_markers)
             response = first_tokens(
                 answer, self.settings.strict_window_tokens, tokenizer
             )
