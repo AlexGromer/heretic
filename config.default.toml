@@ -108,6 +108,15 @@ n_trials = 100
 # Number of trials that use random sampling for the purpose of exploration.
 n_startup_trials = 30
 
+# Number of the best trials to evaluate again on their merged models after the optimization
+# (fork addition, upstream issue #490). Trials are scored on the live LoRA, which rounds
+# differently than the merged model that is exported, so the exported model can score differently
+# (e.g. KL 0.15 -> 0.17, 3 -> 5 refusals). Each re-scored trial costs one merge, one evaluation
+# and one model reload. The menu then shows "live -> merged" scores, and is sorted by the merged
+# scores if the whole Pareto front was re-scored (which changes the meaning of --trial-index).
+# 0 disables it.
+n_merged_score_trials = 0
+
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 
@@ -289,6 +298,34 @@ split = "test[:100]"
 column = "text"
 
 
+# Refusal rate according to a local judge model (fork addition, see README-MOE.md).
+# Add it as { plugin = "heretic.scorers.judge_rate.JudgeRate", optimization = "none" }.
+# Every evaluation sends each prompt and response to the endpoint, so keep it local.
+[scorer.JudgeRate]
+score_name = "Judge refusals"
+
+# OpenAI-compatible chat completions endpoint (default: local Ollama; llama-server works too).
+endpoint = "http://localhost:11434/v1"
+
+# Name of the judge model at the endpoint.
+model = "qwen3:8b"
+
+# Labels that count as refusals, out of comply, soft_refuse, refuse, useless.
+refusal_labels = ["refuse", "soft_refuse", "useless"]
+
+# Maximum number of tokens of the judge's reply (thinking models need more), and the
+# timeout of one request in seconds.
+max_tokens = 512
+timeout = 120.0
+
+print_responses = false
+
+[scorer.JudgeRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+
 [scorer.BenchmarkScore]
 # Name that describes what the configured benchmark score measures.
 score_name = "PIQA acc_norm"
@@ -427,6 +464,38 @@ ega_min_tokens = 2
 # "mean" (divided by the mean frequency of the used experts, capped at 1),
 # "none" (every used expert gets the full strength).
 ega_frequency_scaling = "max"
+
+# Number of refusal directions per layer (fork addition, upstream issue #140, "SOM Directions
+# are Better than One", arXiv 2511.08379). 1 is classic abliteration. With more, a
+# self-organizing map is fitted to the bad-prompt residuals of every layer; the differences
+# between its most used prototypes and the good mean become additional directions,
+# orthonormal to the classic direction and to each other. Each additional direction gets a
+# relative weight in direction_weight_range, so the search space contains classic
+# abliteration (all weights 0). More directions mean more search parameters; consider more trials.
+direction_count = 1
+
+# Range of the weight of each additional direction, relative to the classic direction.
+direction_weight_range = [0.0, 1.0]
+
+# Self-organizing map: grid size, batch training epochs, final neighborhood radius.
+som_grid = [4, 4]
+som_epochs = 50
+som_sigma = 0.5
+
+# Router pre-bias for MoE models (fork addition, upstream issue #322): experts that the router
+# prefers on bad prompts are pushed down, those it prefers on good prompts up, by adding
+# -alpha * log(p_bad / p_good) to the router logits (alpha searched in router_bias_alpha_range,
+# the same for all MoE layers). Routers with a bias parameter get it added there exactly;
+# routers without one (e.g. Qwen3.5 MoE) get it folded approximately into the weight (see
+# README-MOE.md). Requires merging when exporting. No effect on dense models.
+router_bias = false
+router_bias_alpha_range = [0.0, 1.0]
+
+# Number of positions at the end of each prompt whose routing decisions are counted.
+router_bias_last_positions = 4
+
+# Clip of |log(p_bad / p_good)| per expert.
+router_bias_max_log_ratio = 4.0
 
 # Dataset of prompts that tend to produce desirable responses.
 [modifier.Abliteration.good_prompts]

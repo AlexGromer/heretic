@@ -80,6 +80,15 @@ class ExampleConfigTests(unittest.TestCase):
                 "ega_last_positions",
                 "ega_min_tokens",
                 "ega_frequency_scaling",
+                "direction_count",
+                "direction_weight_range",
+                "som_grid",
+                "som_epochs",
+                "som_sigma",
+                "router_bias",
+                "router_bias_alpha_range",
+                "router_bias_last_positions",
+                "router_bias_max_log_ratio",
             ):
                 if hasattr(defaults, key):
                     self.assertEqual(

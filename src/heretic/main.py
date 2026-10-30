@@ -87,6 +87,7 @@ from .config import (
     QuantizationMethod,
 )
 from .evaluator import Evaluator
+from .merged_scoring import rank_by_merged_scores, rescore_on_merged_models
 from .model import Model, get_model_class
 from .modifier import load_and_init_modifiers
 from .plugin import Context, is_builtin_plugin
@@ -188,8 +189,9 @@ def obtain_export_strategy(
         if settings.export_strategy is None:
             print()
             print(
-                "[yellow]Only merging is available, because the fused routed experts "
-                "were modified directly and cannot be stored as a LoRA adapter.[/]"
+                "[yellow]Only merging is available, because weights outside the LoRA "
+                "adapter (fused routed experts or MoE routers) were modified directly "
+                "and cannot be stored as a LoRA adapter.[/]"
             )
             return ExportStrategy.MERGE
 
@@ -826,8 +828,23 @@ def run():
                 ),
             )
 
+            # Fork addition (#490): evaluate the best trials again on their merged
+            # models, which is what an export produces.
+            merged_scores = rescore_on_merged_models(
+                study, sorted_trials, settings, model, evaluator, modifier
+            )
+            sorted_trials = rank_by_merged_scores(
+                sorted_trials, merged_scores, objective_names
+            )
+
             def format_trial_title(trial: FrozenTrial) -> str:
                 prefix = f"[Trial {trial.user_attrs['index']:>3}]"
+                merged_displays = {
+                    record["name"]: Text.from_markup(
+                        record["score"]["rich_display"]
+                    ).plain
+                    for record in merged_scores.get(str(trial.number), [])
+                }
 
                 # We don't directly use the trial.values here since we need to show the
                 # CLI-formatted versions, which are stored in the trial's user attributes.
@@ -835,6 +852,8 @@ def run():
                 for score in trial.user_attrs["scores"]:
                     name = score["name"]
                     value = Text.from_markup(score["score"]["rich_display"]).plain
+                    if name in merged_displays:
+                        value = f"{value} -> {merged_displays[name]}"
                     score_parts.append(f"{name}: {value}")
 
                 return f"{prefix} " + ", ".join(score_parts)
@@ -869,6 +888,13 @@ def run():
                     "chat with it to test how well it works, or run standard benchmarks on it. "
                     "You can return to this menu later to select a different trial. "
                 )
+
+                if merged_scores:
+                    print(
+                        'Scores shown as "live -> merged" were measured on the live LoRA during '
+                        "the optimization and again on the merged model, which is what an export "
+                        "produces."
+                    )
 
                 if not is_interactive():
                     # Without a terminal, the menu cannot be shown (#535), so list the

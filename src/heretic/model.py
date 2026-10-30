@@ -206,6 +206,38 @@ class FusedExperts:
         return (self.layer_index, self.path)
 
 
+@dataclass
+class ParameterHandle:
+    """
+    Handle for any parameter of a decoder layer that is modified directly (like fused
+    experts), e.g. a router weight. Model.begin_fused_edit accepts it like FusedExperts.
+    """
+
+    layer_index: int
+    # Path of the parameter relative to the decoder layer, e.g. "mlp.gate.weight".
+    path: str
+    # The module that directly owns the parameter.
+    module: Module
+    # Name of the parameter within that module.
+    parameter_name: str
+
+    @property
+    def parameter(self) -> Tensor:
+        return getattr(self.module, self.parameter_name)
+
+    @property
+    def key(self) -> tuple[int, str]:
+        return (self.layer_index, self.path)
+
+
+def resolve_layer_path(layers: Any, layer_index: int, path: str) -> Tensor:
+    """The tensor at `path` (e.g. "mlp.experts.down_proj") of a decoder layer."""
+    target: Any = layers[layer_index]
+    for part in path.split("."):
+        target = getattr(target, part)
+    return cast(Tensor, target)
+
+
 def reshape_module_io(
     tensor: Tensor,
     batch_shape: tuple[int, int] | None,
@@ -892,7 +924,7 @@ class Model:
         self._fused_modified: set[tuple[int, str]] = set()
         self._warnings_shown: set[str] = set()
 
-    def begin_fused_edit(self, fused: FusedExperts):
+    def begin_fused_edit(self, fused: FusedExperts | ParameterHandle):
         """
         Must be called before the weights of fused experts are modified in place.
         Keeps a copy of the original values (on the device given by
@@ -924,18 +956,16 @@ class Model:
         if not self._fused_modified:
             return
 
-        # Index the current handles by key instead of walking all layers
-        # once per modified tensor.
-        handles = {
-            fused.key: fused
-            for layer_index in {key[0] for key in self._fused_modified}
-            for fused_list in self.get_layer_fused_experts(layer_index).values()
-            for fused in fused_list
-        }
+        # The keys are (layer index, path), which also covers other directly modified
+        # parameters such as router weights (ParameterHandle).
+        layers = self.get_layers()
 
         with torch.no_grad():
             for key in self._fused_modified:
-                handles[key].parameter.copy_(self._fused_backups[key])
+                layer_index, path = key
+                resolve_layer_path(layers, layer_index, path).copy_(
+                    self._fused_backups[key]
+                )
 
         self._fused_modified.clear()
 
@@ -944,21 +974,14 @@ class Model:
         Copies the current values of all modified fused expert tensors
         into the corresponding tensors of another instance of the same model.
         """
+        layers = self.get_layers()
         other_layers = self._get_layers_of(other_model)
 
         with torch.no_grad():
             for layer_index, path in self._fused_modified:
-                source = next(
-                    fused
-                    for fused_list in self.get_layer_fused_experts(layer_index).values()
-                    for fused in fused_list
-                    if fused.path == path
+                resolve_layer_path(other_layers, layer_index, path).copy_(
+                    resolve_layer_path(layers, layer_index, path)
                 )
-                target = other_layers[layer_index]
-                for part in path.split("."):
-                    target = getattr(target, part)
-
-                cast(Tensor, target).copy_(source.parameter)
 
     def _apply_system_role(
         self, messages: list[dict[str, str]]

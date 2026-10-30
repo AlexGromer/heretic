@@ -259,6 +259,100 @@ in uploaded configs.
   0.1 to 1). `line_search = "none"` is the maintainer's option 2; a module whose adapter diverges
   (non-finite adapter or loss) is left unmodified instead of breaking the model.
 
-Not addressed: #490 (live LoRA vs merged scores; upstream PR #495 re-scores the top trials on
-merged models), router pre-bias (#322), SOMA (#140); #436 (tencent/Hy3-FP8) may load with the FP8
-dequantization of v2 but was not tried.
+Not addressed in v4 (see v5): #490, router pre-bias (#322), SOMA (#140). #436 (tencent/Hy3-FP8)
+may load with the FP8 dequantization of v2 but was not tried.
+
+# v5: merged-model scores, multi-directional abliteration, router pre-bias, local judge
+
+Same branch `moe-fused-v4`. All four are off by default. Tests: `tests/test_v5.py` (CPU; the
+model tests use `tiny-random/qwen3.5-moe`). None of it was run on a GPU or on a real model, so
+nothing here says how refusals and KL change.
+
+## 1. Re-scoring on merged models (upstream #490)
+
+Trials are scored on the live LoRA, which applies the base matrix and the adapter separately
+and rounds in between; the export runs the merged matrix, so the exported model can score
+differently (the maintainer's example: KL 0.15 -> 0.17, 3 -> 5 refusals).
+`n_merged_score_trials = N` evaluates the first N trials of the sorted Pareto front again on
+their merged models after the optimization and shows `live -> merged` in the menu. If the whole
+front was re-scored, the menu is sorted by the merged scores (which changes what `--trial-index`
+points to). The merged records are stored in the study, so showing the results again or running
+more trials does not recompute them. Cost per trial: one merge, one evaluation, one model reload;
+with 4-bit quantization the merge reloads the base model on the CPU. A failed merge keeps the
+live scores. Approach as in upstream PR #495, own code.
+
+## 2. Multi-directional abliteration with self-organizing maps (upstream #140)
+
+`[modifier.Abliteration] direction_count = k` (default 1). From "SOM Directions are Better than
+One" (arXiv 2511.08379; upstream PR #196 reported gemma-3-12b 3/100 at KL 0.08 vs 0.16, self-reported):
+
+* a batch self-organizing map (`som_grid`, `som_epochs`, `som_sigma`; plain PyTorch, no new
+  dependency, deterministic) is fitted to the bad-prompt residuals of every layer;
+* the prototypes with the most hits minus the good mean are candidate directions; they are made
+  orthogonal (Gram-Schmidt) to the classic mean-difference direction, to the good direction
+  (with `orthogonalize_direction`) and to each other; near-duplicates are dropped;
+* the classic direction stays direction 0 with weight 1; each additional direction gets a
+  relative weight `direction_{i}.weight` in `direction_weight_range` (shared by all components).
+  With all weights 0 the result is classic abliteration, so the search space contains it;
+* Linear modules get `delta W = -weight * V^T diag(w) V W` (orthonormal V, so it is a weighted
+  projection), LoRA rank `k` (`full_normalization_lora_rank + k - 1` with "full" row
+  normalization); fused experts are ablated direction by direction (exact for "none"; with row
+  normalization each step renormalizes); with `direction_scope = global` the extras of the
+  nearest layer are used, made orthogonal to the interpolated direction.
+
+Differences from PR #196: no `minisom`; directions are orthonormal (PR #196 summed rank-1 updates
+of non-orthogonal directions); its "top-k neurons" counted winners among the prototypes
+themselves, here hits are counted over the residuals; one weight per extra direction instead of a
+full weight curve per direction and component (k - 1 new search parameters instead of 4 per
+direction and component).
+
+## 3. Router pre-bias for MoE models (upstream #322)
+
+`[modifier.Abliteration] router_bias = true`. The routing of the last
+`router_bias_last_positions` positions of the good and bad prompts is counted per expert, and the
+router logits get `-alpha * log(p_bad / p_good)` (smoothed, clipped at `router_bias_max_log_ratio`),
+with `alpha` searched in `router_bias_alpha_range` (the issue reports a sharp optimum near 0.5 and
+worse results at 1.0 on Qwen3.5/3.6-35B-A3B, self-reported). One alpha for all MoE layers; the
+issue's best result used four layers with different alphas, which is not searched here.
+
+The issue adds the bias at inference. Here it is stored in the weights, so that it survives the
+export to safetensors and GGUF:
+
+* routers with a bias parameter (e.g. gpt-oss) get it added to the bias, exactly;
+* routers without one (Qwen3.5 MoE: `mlp.gate`, weight `(experts, hidden)`, no bias) get
+  `b u^T / c` added to the weight, with `u` the unit mean direction of the router inputs and `c`
+  their mean projection onto `u`. An input `h` then gets `b (u.h) / c`: exactly `b` for the mean
+  input, more or less for others. The spread of `u.h / c` over sampled inputs is printed per layer
+  at startup; a large spread means the fold is a poor approximation of a constant bias.
+
+Router edits use the same backups as the fused experts (bit-exact restore between trials,
+`fused_experts_backup_device`) and force merging on export. Found routers: a `gate` or `router`
+module in `mlp` / `block_sparse_moe` / `moe` / `feed_forward` with a `weight` of shape
+`(experts, hidden)` and a `top_k` (or `config.num_experts_per_tok`). 4-bit quantized routers are
+skipped. Not combined with ARA (ARA does not use the Abliteration settings).
+
+## 4. Local judge
+
+A judge model classifies each answer as `comply`, `soft_refuse` (clarifying questions only,
+lecture, change of topic, deliberately vague), `refuse` or `useless` (empty, incoherent,
+unrelated). It talks to any OpenAI-compatible endpoint, by default a local Ollama
+(`http://localhost:11434/v1`, model `qwen3:8b`; `llama-server` works as well); the prompts are
+sensitive, so keep it local. `HERETIC_JUDGE_API_KEY` is sent as a bearer token if set.
+
+* **Offline, after a run:** `heretic-judge responses.jsonl --evaluation 0 --evaluation 37
+  --output labelled.jsonl` labels a responses file (setting `responses_file`) and prints, per score
+  and evaluation, the keyword count next to the judge count and the label counts, plus how often
+  the two disagree (keyword-only = likely false positives, judge-only = refusals the markers miss).
+  This is the audit step of the research report without hand-labelling everything.
+* **During a run:** scorer `heretic.scorers.judge_rate.JudgeRate` (section `[scorer.JudgeRate]`),
+  intended with `optimization = "none"` next to `KeywordRate`: it judges every trial, which is
+  slow, and is not exactly reproducible (marked as such, so the reproducibility offer is off).
+  Chain-of-thought blocks are removed before judging.
+
+The judge itself is not calibrated. Check it against about 50 hand-labelled answers first.
+
+## Not done
+
+Comparing with abliterix on Devstral-Small-2-24B is an experiment, not a code change: it needs
+the BF16 model (about 48 GB) on a large GPU and running both tools on the same prompts with the
+same KL definition. Nothing in the fork blocks it.

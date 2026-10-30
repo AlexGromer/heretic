@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, cast
 
@@ -22,6 +22,7 @@ from pydantic import (
 from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
+from heretic.directions import compute_extra_directions, interpolate_extras
 from heretic.ega import (
     EgaPlan,
     FrequencyScaling,
@@ -31,6 +32,11 @@ from heretic.ega import (
 from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.ranges import check_range
+from heretic.router_bias import (
+    RouterBiasPlan,
+    apply_router_bias,
+    build_router_bias_plans,
+)
 from heretic.utils import format_dataset_specification, print
 
 
@@ -46,6 +52,11 @@ class WeightDistribution:
 class Parameters(Serializable):
     direction_index: float | None
     weight_distributions: dict[str, WeightDistribution]
+    # Fork additions. Relative weights of the additional refusal directions (one per
+    # direction after the first, see Settings.direction_count), and the strength of the
+    # router pre-bias (see Settings.router_bias).
+    direction_weights: list[float] = field(default_factory=list)
+    router_bias_alpha: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +74,12 @@ class Parameters(Serializable):
             for name, value in asdict(weight_distribution).items():
                 parameters[f"{component}.{name}"] = f"{value:.2f}"
 
+        for index, weight in enumerate(self.direction_weights, start=1):
+            parameters[f"direction_{index}.weight"] = f"{weight:.2f}"
+
+        if self.router_bias_alpha:
+            parameters["router_bias_alpha"] = f"{self.router_bias_alpha:.2f}"
+
         return parameters
 
     @classmethod
@@ -75,6 +92,8 @@ class Parameters(Serializable):
                     "weight_distributions"
                 ].items()
             },
+            direction_weights=list(data.get("direction_weights", [])),
+            router_bias_alpha=data.get("router_bias_alpha", 0.0),
         )
 
 
@@ -270,6 +289,77 @@ class Settings(BaseModel):
         ),
     )
 
+    # Multi-directional abliteration with self-organizing maps (fork addition, upstream #140).
+    direction_count: PositiveInt = Field(
+        default=1,
+        description=(
+            "Number of refusal directions per layer. 1 is classic abliteration. With more, a "
+            "self-organizing map is fitted to the bad-prompt residuals of every layer, and the "
+            "differences between its most used prototypes and the good mean become additional "
+            "directions, orthonormal to the classic direction and to each other. Each additional "
+            "direction gets its own relative weight in the search (direction_weight_range)."
+        ),
+    )
+
+    direction_weight_range: tuple[float, float] = Field(
+        default=(0.0, 1.0),
+        description="Range of the weight of each additional direction, relative to the weight of the classic direction.",
+    )
+
+    som_grid: tuple[PositiveInt, PositiveInt] = Field(
+        default=(4, 4),
+        description="Size of the self-organizing map grid (neurons per axis).",
+    )
+
+    som_epochs: PositiveInt = Field(
+        default=50,
+        description="Number of batch training epochs of the self-organizing map.",
+    )
+
+    som_sigma: float = Field(
+        default=0.5,
+        description="Final neighborhood radius of the self-organizing map (it starts at half the grid size).",
+    )
+
+    # Router pre-bias for MoE models (fork addition, upstream #322).
+    router_bias: bool = Field(
+        default=False,
+        description=(
+            "Bias the routers of MoE layers away from the experts that bad prompts prefer and "
+            "towards those that good prompts prefer: b = -alpha * log(p_bad / p_good), with alpha "
+            "searched in router_bias_alpha_range. Stored in the router bias if the router has one, "
+            "otherwise folded approximately into the router weight. Has no effect on dense models."
+        ),
+    )
+
+    router_bias_alpha_range: tuple[float, float] = Field(
+        default=(0.0, 1.0),
+        description="Range of the strength alpha of the router pre-bias.",
+    )
+
+    router_bias_last_positions: PositiveInt = Field(
+        default=4,
+        description="Number of positions at the end of each prompt whose routing is counted.",
+    )
+
+    router_bias_max_log_ratio: float = Field(
+        default=4.0,
+        description="Clip of |log(p_bad / p_good)| per expert, so that rarely used experts do not get extreme biases.",
+    )
+
+    @field_validator("direction_weight_range", "router_bias_alpha_range")
+    @classmethod
+    def validate_fork_weight_ranges(
+        cls, value: tuple[float, float], info: ValidationInfo
+    ) -> tuple[float, float]:
+        return check_range(info.field_name, value, lower_limit=0.0)
+
+    @field_validator("som_sigma", "router_bias_max_log_ratio")
+    @classmethod
+    def validate_fork_positive(cls, value: float, info: ValidationInfo) -> float:
+        check_range(info.field_name, (value, value), strictly_positive=True)
+        return value
+
 
 # The maximum number of elements of the temporary float32 tensors that are created
 # per chunk when modifying fused experts. A chunk of 2**26 elements takes 256 MiB
@@ -348,6 +438,10 @@ def ablate_fused_experts(
 
 class Abliteration(Modifier[Parameters]):
     settings: Settings
+    # Fork additions, set by init. The class defaults (no extra directions, no router
+    # pre-bias) also apply to instances that are set up without init, e.g. in tests.
+    extra_directions: Tensor | None = None
+    router_plans: tuple[RouterBiasPlan, ...] = ()
 
     @property
     def reproducible(self) -> bool:
@@ -425,12 +519,46 @@ class Abliteration(Modifier[Parameters]):
                 dim=1,
             )
 
+        # Additional directions per residual row (fork addition, #140):
+        # shape (row, direction_count - 1, hidden).
+        self.extra_directions = None
+        if self.settings.direction_count > 1:
+            print(
+                f"* Fitting self-organizing maps for [bold]{self.settings.direction_count - 1}[/] "
+                "additional directions per layer..."
+            )
+            bad_residuals = model.get_residuals_batched(
+                bad_prompts,
+                winsorization_quantile=self.settings.winsorization_quantile,
+            )
+            self.extra_directions = compute_extra_directions(
+                bad_residuals.cpu(),
+                good_means.cpu(),
+                self.residual_directions.cpu(),
+                self.settings.direction_count - 1,
+                grid=self.settings.som_grid,
+                epochs=self.settings.som_epochs,
+                sigma_end=self.settings.som_sigma,
+                orthogonalize_good=self.settings.orthogonalize_direction,
+            ).to(self.residual_directions.device)
+            del bad_residuals
+            found = (self.extra_directions.norm(dim=2) > 0).sum(dim=1)
+            print(
+                f"* Additional directions found per layer: min [bold]{int(found.min())}[/], "
+                f"max [bold]{int(found.max())}[/]"
+            )
+
         if self.settings.row_normalization != RowNormalization.FULL:
-            # Rank 1 is sufficient for directional ablation without renormalization.
-            self.lora_rank = 1
+            # Rank 1 is sufficient for directional ablation without renormalization
+            # (one rank per direction with several directions).
+            self.lora_rank = self.settings.direction_count
         else:
             # Row magnitude preservation introduces nonlinear effects.
-            self.lora_rank = self.settings.full_normalization_lora_rank
+            self.lora_rank = (
+                self.settings.full_normalization_lora_rank
+                + self.settings.direction_count
+                - 1
+            )
 
         if model.has_fused_experts():
             print()
@@ -469,6 +597,39 @@ class Abliteration(Modifier[Parameters]):
                         f"{len(plan.used_experts())} of {plan.scales.shape[0]} experts "
                         f"used by bad prompts, {int(plan.fallback.sum())} with layer direction"
                     )
+
+        self.router_plans = ()
+        if self.settings.router_bias:
+            print()
+            print(
+                "Calculating router pre-bias (routing frequencies of good and bad prompts)..."
+            )
+            self.router_plans = tuple(
+                build_router_bias_plans(
+                    model,
+                    good_prompts,
+                    bad_prompts,
+                    last_positions=self.settings.router_bias_last_positions,
+                    max_log_ratio=self.settings.router_bias_max_log_ratio,
+                )
+            )
+            if not self.router_plans:
+                print(
+                    "[yellow]WARNING: router_bias = true, but no MoE router was found; "
+                    "the router pre-bias has no effect.[/]"
+                )
+            for plan in self.router_plans:
+                if plan.router.bias is not None:
+                    storage = "router bias"
+                else:
+                    storage = (
+                        "folded into the weight, input projection spread "
+                        f"{plan.projection_spread:.2f}"
+                    )
+                print(
+                    f"* Layer {plan.router.layer_index} [bold]{plan.router.path}[/]: "
+                    f"|log ratio| max {float(plan.log_ratio.abs().max()):.2f}, {storage}"
+                )
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -561,9 +722,30 @@ class Abliteration(Modifier[Parameters]):
                 min_weight_distance=min_weight_distance,
             )
 
+        direction_weights = [
+            trial.suggest_float(
+                f"direction_{index}.weight",
+                self.settings.direction_weight_range[0],
+                self.settings.direction_weight_range[1],
+            )
+            for index in range(1, self.settings.direction_count)
+        ]
+
+        router_bias_alpha = (
+            trial.suggest_float(
+                "router_bias_alpha",
+                self.settings.router_bias_alpha_range[0],
+                self.settings.router_bias_alpha_range[1],
+            )
+            if self.router_plans
+            else 0.0
+        )
+
         return Parameters(
             direction_index=direction_index,
             weight_distributions=weight_distributions,
+            direction_weights=direction_weights,
+            router_bias_alpha=router_bias_alpha,
         )
 
     def global_residual_direction(self, direction_index: float) -> Tensor:
@@ -633,6 +815,31 @@ class Abliteration(Modifier[Parameters]):
             else:
                 return residual_direction
 
+        global_extras = None
+        if self.extra_directions is not None and residual_direction is not None:
+            assert parameters.direction_index is not None
+            global_extras = interpolate_extras(
+                self.extra_directions.cpu(),
+                parameters.direction_index,
+                residual_direction.cpu(),
+            ).to(self.extra_directions.device)
+
+        def get_layer_extra_directions(layer_index: int) -> list[tuple[Tensor, float]]:
+            # The additional directions of the layer with their relative weights,
+            # leaving out those with weight 0 and those the SOM did not find.
+            if self.extra_directions is None:
+                return []
+            extras = (
+                self.extra_directions[layer_index + 1]
+                if global_extras is None
+                else global_extras
+            )
+            return [
+                (extras[index], weight)
+                for index, weight in enumerate(parameters.direction_weights)
+                if weight > 0 and bool(extras[index].norm() > 0)
+            ]
+
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(model.get_layers())):
@@ -651,6 +858,20 @@ class Abliteration(Modifier[Parameters]):
                     model.begin_fused_edit(fused)
 
                     plan = self.ega_plans.get(fused.key) if self.settings.ega else None
+
+                    for extra_direction, extra_weight in get_layer_extra_directions(
+                        layer_index
+                    ):
+                        # The directions are orthonormal, so ablating them one after
+                        # the other equals ablating them together (exactly for "none";
+                        # with row normalization, each step renormalizes the rows).
+                        ablate_fused_experts(
+                            fused.parameter,
+                            fused.row_axis,
+                            extra_direction,
+                            weight * extra_weight,
+                            self.settings.row_normalization,
+                        )
 
                     if plan is None:
                         ablate_fused_experts(
@@ -732,14 +953,29 @@ class Abliteration(Modifier[Parameters]):
                         # Normalize the weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
 
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
+                    extras = get_layer_extra_directions(layer_index)
+                    if not extras:
+                        # Calculate lora_A = v^T W
+                        # v is (d_out,), W is (d_out, d_in)
+                        # v @ W -> (d_in,)
+                        lora_A = (v @ W).view(1, -1)
 
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
+                        # Calculate lora_B = -weight * v
+                        # v is (d_out,)
+                        lora_B = (-weight * v).view(-1, 1)
+                    else:
+                        # Several orthonormal directions V (direction, d_out) with
+                        # relative weights w: delta W = -weight * V^T diag(w) V W,
+                        # i.e. lora_A = V W and lora_B = -weight * V^T diag(w).
+                        V = torch.stack(
+                            [v] + [direction.to(v.device) for direction, _ in extras]
+                        )
+                        w = torch.tensor(
+                            [1.0] + [extra_weight for _, extra_weight in extras],
+                            device=v.device,
+                        )
+                        lora_A = V @ W
+                        lora_B = -weight * (V.T * w)
 
                     if self.settings.row_normalization == RowNormalization.PRE:
                         # Make the LoRA adapter apply to the original weight matrix.
@@ -782,8 +1018,24 @@ class Abliteration(Modifier[Parameters]):
                     # These casts are therefore valid.
                     weight_A = cast(Tensor, module.lora_A["default"].weight)
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
+                    # With several directions, the adapter rank is the maximum number
+                    # of directions; pad with zeros when fewer are used in this trial.
+                    rank = weight_A.shape[0]
+                    if lora_A.shape[0] < rank:
+                        padding = rank - lora_A.shape[0]
+                        lora_A = torch.cat(
+                            [lora_A, lora_A.new_zeros(padding, lora_A.shape[1])]
+                        )
+                        lora_B = torch.cat(
+                            [lora_B, lora_B.new_zeros(lora_B.shape[0], padding)],
+                            dim=1,
+                        )
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+        # Router pre-bias (fork addition, #322): the same strength for every MoE layer.
+        for router_plan in self.router_plans:
+            apply_router_bias(model, router_plan, parameters.router_bias_alpha)
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()

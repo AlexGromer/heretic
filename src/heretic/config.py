@@ -451,6 +451,18 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    n_merged_score_trials: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "Number of the best trials to evaluate again on their merged models after the "
+            "optimization (fork addition, upstream issue #490). The live LoRA the trials are "
+            "scored with rounds differently than the merged model that is exported, so the "
+            "exported model can score differently. Each re-scored trial costs one merge, one "
+            "evaluation and one model reload. If every trial of the Pareto front was re-scored, "
+            "the menu is sorted by the merged scores. 0 disables it."
+        ),
+    )
+
     seed: int | None = Field(
         default=None,
         description=(
