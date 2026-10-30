@@ -433,8 +433,7 @@ must not share the GPU with the evaluated model:
   `train/bad_eval.meta.jsonl`), set name `judge_ranking_set`, model label `judge_ranking_model_name`.
 * `--trial-number N` selects the trial shown as `[Trial N]` (the `trial` field of the rows), from
   all completed trials, independent of the menu order; `--trial-index` still counts menu positions.
-* `config.colab.toml`: refusal-eval `train/` sets (bad_train / good_train for ARA, bad_eval for the
-  keyword objective and the ranking, alpaca test[:100] for KL), study and files on Google Drive,
-  the two-run recipe (optimize and write candidates; judge; export trial N) in its header.
+* Colab configs (paths, Drive layout, the two-run recipe) belong to heretic-colab-pipeline, which
+  generates its own `config.*.cyber.toml`; this branch only adds the Heretic code they can call.
 
 Tests: `tests/test_colab_handoff.py`.
