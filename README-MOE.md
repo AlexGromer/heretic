@@ -610,3 +610,41 @@ diagnostics.
   runner needs to vendor it. Only `src/` travels: configs and tests stay here.
 
 Tests: `tests/test_v9.py`.
+
+# v10: the handoff as it is actually called
+
+Branch `resume-settings`. Four things that the end-to-end path through a Colab runner needs and
+that the previous versions got wrong or left out. All of them were found by reading the calls, not
+by a failing test; the tests came after.
+
+* **A resumed study no longer overrides the knobs of the single run.** `--checkpoint-action
+  continue` validates the settings stored in the finished study, so everything that is not
+  `exclude=True` comes from the optimization run and not from the command line (that is why a
+  runner has to write `trial_index` into the stored settings to pick a trial). The settings that
+  only describe what this one invocation should do after the optimization are therefore excluded
+  now: `trial_number`, `n_merged_score_trials` and every `judge_ranking_*` setting
+  (`n_judge_ranking_trials`, `judge_ranking_mode`, `..._max_kl`, `..._set`, `..._model_name`,
+  `..._response_length`, `..._batch_size`, `..._merged`, `..._benchmarks`,
+  `..._hold_out_patterns`, `..._holdout_version`). Before this, `heretic --trial-number N
+  --judge-ranking-mode generate ...` over an existing journal silently did what the optimization
+  run had asked for: the trial number was dropped and nothing was generated. The study's journals
+  written so far carry the old keys, and the excluded settings now lose to the current run, which
+  is what a second invocation means.
+* **A plain text prompts file.** `judge_ranking_prompts_file` reads JSON Lines with `id`,
+  `category` and `prompt` (the harness's `.meta.jsonl`) **or** one prompt per line, because a
+  Colab bundle carries the plain text sets and not the meta files. A text line that happens to be
+  valid JSON is only read as a row when it is an object with a `prompt`.
+* **The generated rows carry `holdout_version` and `lang`.** The harness groups its summaries by
+  `(model, trial, mode, thinking, set, holdout_version)` and reads a row without a
+  `holdout_version` as hold-out v1, which ranking answers are not; it also reports rates per
+  prompt language from `lang`. The new `judge_ranking_holdout_version` defaults to `"train"`, the
+  harness's own stamp for the training sets, and `lang` comes from the same rule as the harness's
+  `detect_lang`.
+* **What still cannot be called in Colab** (runner work, not this repository): the notebook bundle
+  carries `eval/data/*.jsonl` (the hold-out) and `cyber/*.txt` (the training sets) only, so
+  `config.orbench.toml`'s validation set (`val/orbench_val.*`) and the `.meta.jsonl` ids and
+  categories never arrive there. Ranking in Colab therefore runs on `cyber/bad_eval.txt` with
+  synthetic ids and no categories, which the per-category diagnostics of v9 cannot use.
+
+Tests: the new cases in `tests/test_judge_handoff.py` (what a resumed run keeps, both prompt file
+formats, the two new row fields).

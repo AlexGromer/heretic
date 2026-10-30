@@ -461,6 +461,7 @@ class Settings(BaseSettings):
             "(REFUSAL + PARTIAL by default), which changes what --trial-index points to. "
             "Results are stored in the study. 0 disables it."
         ),
+        exclude=True,
     )
 
     judge_ranking_mode: Literal["judge", "generate"] = Field(
@@ -472,6 +473,7 @@ class Settings(BaseSettings):
             "which must not share the GPU with the evaluated model); then select the trial with "
             "--trial-number."
         ),
+        exclude=True,
     )
 
     judge_ranking_merged: bool = Field(
@@ -482,6 +484,7 @@ class Settings(BaseSettings):
             "differently, upstream issue #490). Costs one model reload per ranked trial; false "
             "generates with the live LoRA (faster, slightly different from the exported model)."
         ),
+        exclude=True,
     )
 
     judge_ranking_benchmarks: list[str] = Field(
@@ -494,6 +497,7 @@ class Settings(BaseSettings):
             "run on every trial. Empty disables it; the results are stored in the study and "
             "shown next to the judged trials."
         ),
+        exclude=True,
     )
 
     judge_ranking_output: str | None = Field(
@@ -524,21 +528,35 @@ class Settings(BaseSettings):
             "Ranking trials on such a file makes its numbers for the selected trial optimistic, "
             "so Heretic prints a warning. Empty disables the check."
         ),
+        exclude=True,
     )
 
     judge_ranking_set: str = Field(
         default="bad_eval",
         description='Set name written into the generated rows (the evaluation harness "set").',
+        exclude=True,
     )
 
     judge_ranking_model_name: str | None = Field(
         default=None,
         description="Model label written into the generated rows (default: the last part of the model path).",
+        exclude=True,
+    )
+
+    judge_ranking_holdout_version: str = Field(
+        default="train",
+        description=(
+            'Value of the "holdout_version" field of the generated rows. The evaluation harness '
+            "groups its summaries by it and reads a row without one as hold-out v1, which "
+            'ranking answers are not; its own stamp for the training sets is "train".'
+        ),
+        exclude=True,
     )
 
     judge_ranking_max_kl: float = Field(
         default=0.15,
         description="Largest KL divergence of a trial that is judged.",
+        exclude=True,
     )
 
     judge_ranking_response_length: PositiveInt = Field(
@@ -547,6 +565,7 @@ class Settings(BaseSettings):
             "Maximum number of tokens of each answer that is judged (the evaluation harness uses 512). "
             "Longer than max_response_length, because PARTIAL answers often turn evasive later."
         ),
+        exclude=True,
     )
 
     judge_ranking_batch_size: NonNegativeInt = Field(
@@ -555,6 +574,7 @@ class Settings(BaseSettings):
             "Batch size for generating the judged answers (0 = batch_size). Longer answers need "
             "more memory than the batch size was determined for."
         ),
+        exclude=True,
     )
 
     n_merged_score_trials: NonNegativeInt = Field(
@@ -567,6 +587,7 @@ class Settings(BaseSettings):
             "evaluation and one model reload. If every trial of the Pareto front was re-scored, "
             "the menu is sorted by the merged scores. 0 disables it."
         ),
+        exclude=True,
     )
 
     seed: int | None = Field(
@@ -670,8 +691,12 @@ class Settings(BaseSettings):
         description=(
             'Number of the trial to use, as shown in "[Trial N]" (fork addition). Unlike trial_index, '
             "it does not depend on the order of the menu, and any completed trial can be selected, "
-            "not only Pareto optimal ones."
+            "not only Pareto optimal ones. Which trial to export is a choice of the single run, so "
+            "this setting is not stored in the study and is not restored from it by "
+            '--checkpoint-action continue (unlike trial_index, which has to be written into the '
+            "stored settings to survive a resume)."
         ),
+        exclude=True,
     )
 
     n_additional_trials: PositiveInt | None = Field(

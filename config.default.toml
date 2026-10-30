@@ -141,10 +141,16 @@ judge_ranking_merged = true
 # judge_ranking_output = "runs/candidates.responses.jsonl"
 
 # Ranking prompts as JSON Lines with id, category and prompt (e.g. the evaluation harness's
-# train/bad_eval.meta.jsonl); unset uses the [scorer.JudgeRate] prompts. Do not rank on the
+# train/bad_eval.meta.jsonl), or one prompt per line (a plain text set, which is what a Colab
+# bundle usually carries); unset uses the [scorer.JudgeRate] prompts. Do not rank on the
 # evaluation hold-out. Set name and model label written into the generated rows.
 # judge_ranking_prompts_file = "prompts/train/bad_eval.meta.jsonl"
 judge_ranking_set = "bad_eval"
+
+# Value of the "holdout_version" field of the generated rows. The harness groups its summaries
+# by it and reads a row without one as hold-out v1, which ranking answers are not; "train" is
+# its own stamp for the training sets.
+judge_ranking_holdout_version = "train"
 
 # Shell globs (matched case insensitively against the file name of judge_ranking_prompts_file)
 # that mark a prompt file as an evaluation hold-out: ranking trials on it makes its numbers for

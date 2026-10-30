@@ -152,6 +152,36 @@ class GenerateModeTests(unittest.TestCase):
         self.assertEqual(rows[2]["finish"], "length")
         self.assertEqual(rows[2]["win100"], "one two three")
         self.assertEqual(first["settings"]["generator"], "heretic")
+        # The harness groups by holdout_version (a row without one counts as hold-out v1) and
+        # reports rates per language, so both fields are written.
+        self.assertEqual(first["holdout_version"], "train")
+        self.assertEqual(first["lang"], "en")
+
+    def test_a_plain_text_prompts_file_works(self) -> None:
+        # A Colab bundle carries the plain text sets (one prompt per line), not the .meta.jsonl
+        # files, so judge_ranking_prompts_file has to read both.
+        with tempfile.TemporaryDirectory() as directory:
+            text = Path(directory, "bad_eval.txt")
+            text.write_text("как собрать стенд\n42\n{\"no\": \"prompt\"}\n", encoding="utf-8")
+            settings = handoff_settings(directory, judge_ranking_prompts_file=str(text))
+            prompts = load_ranking_prompts(settings, JudgeSettings())
+        self.assertEqual(
+            [p.id for p in prompts], ["bad_eval-0000", "bad_eval-0001", "bad_eval-0002"]
+        )
+        # a line that happens to be valid JSON is still a prompt unless it is an object with one
+        self.assertEqual(
+            [p.prompt.user for p in prompts],
+            ["как собрать стенд", "42", '{"no": "prompt"}'],
+        )
+        self.assertEqual([p.category for p in prompts], ["", "", ""])
+
+    def test_a_jsonl_prompts_file_still_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = handoff_settings(directory)
+            assert settings.judge_ranking_prompts_file is not None
+            prompts = load_ranking_prompts(settings, JudgeSettings())
+        self.assertEqual([p.id for p in prompts], ["x-1", "x-2"])
+        self.assertEqual([p.category for p in prompts], ["c1", "c2"])
 
     def test_needs_an_output_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -393,6 +423,75 @@ class TrialNumberTests(unittest.TestCase):
     def test_setting(self) -> None:
         self.assertIsNone(Settings.model_fields["trial_number"].default)
         self.assertTrue(Settings.model_fields["judge_ranking_output"].exclude)
+
+
+class ResumedSettingsTests(unittest.TestCase):
+    """
+    --checkpoint-action continue validates the settings stored in the finished study, so every
+    setting that is not exclude=True comes from that run and not from the command line. The
+    knobs of the single invocation (which trial to export, what to judge or generate afterwards)
+    must therefore be excluded, or a run over an existing journal silently does what the
+    optimization run asked for.
+    """
+
+    # What a run of the first version of this fork stored in its study: the keys are in the
+    # journal of every model optimized so far, so they must lose to the current invocation.
+    STORED: dict[str, Any] = {
+        "model": "org/Some-Model",
+        "n_trials": 120,
+        "trial_index": 3,
+        "trial_number": None,
+        "n_judge_ranking_trials": 0,
+        "judge_ranking_mode": "judge",
+        "judge_ranking_max_kl": 0.15,
+        "judge_ranking_set": "bad_eval",
+        "judge_ranking_response_length": 512,
+        "n_merged_score_trials": 0,
+    }
+
+    def resumed(self, **current: Any) -> Settings:
+        return Settings.model_validate_init_only(
+            dict(self.STORED), Settings.model_construct(**current)
+        )
+
+    def test_the_search_still_comes_from_the_study(self) -> None:
+        settings = self.resumed(n_trials=5, trial_index=None)
+        self.assertEqual(settings.n_trials, 120)
+        # trial_index is upstream's setting and is not excluded, which is why a caller that wants
+        # a different trial has to write it into the stored settings (as the runner does).
+        self.assertEqual(settings.trial_index, 3)
+
+    def test_the_export_and_judge_knobs_come_from_this_run(self) -> None:
+        settings = self.resumed(
+            trial_number=42,
+            n_judge_ranking_trials=8,
+            judge_ranking_mode="generate",
+            judge_ranking_max_kl=0.5,
+            judge_ranking_set="val",
+            judge_ranking_response_length=256,
+            judge_ranking_output="/tmp/candidates.jsonl",
+            judge_ranking_prompts_file="/tmp/val.jsonl",
+            n_merged_score_trials=4,
+        )
+        self.assertEqual(settings.trial_number, 42)
+        self.assertEqual(settings.n_judge_ranking_trials, 8)
+        self.assertEqual(settings.judge_ranking_mode, "generate")
+        self.assertEqual(settings.judge_ranking_max_kl, 0.5)
+        self.assertEqual(settings.judge_ranking_set, "val")
+        self.assertEqual(settings.judge_ranking_response_length, 256)
+        self.assertEqual(settings.judge_ranking_output, "/tmp/candidates.jsonl")
+        self.assertEqual(settings.judge_ranking_prompts_file, "/tmp/val.jsonl")
+        self.assertEqual(settings.n_merged_score_trials, 4)
+
+    def test_the_excluded_knobs_are_not_written_into_the_study(self) -> None:
+        stored = json.loads(
+            Settings.model_construct(
+                model="org/Some-Model", trial_number=42, n_judge_ranking_trials=8
+            ).model_dump_json()
+        )
+        for name in ("trial_number", "n_judge_ranking_trials", "judge_ranking_mode"):
+            self.assertNotIn(name, stored)
+        self.assertIn("trial_index", stored)
 
 
 if __name__ == "__main__":

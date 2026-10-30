@@ -30,7 +30,7 @@ from .rows import model_label, response_key, response_row
 from .scorers.judge_rate import JudgeRate, judge_responses
 from .scorers.judge_rate import Settings as JudgeSettings
 from .system import empty_cache
-from .utils import Prompt, format_exception, load_prompts, print
+from .utils import Prompt, detect_lang, format_exception, load_prompts, print
 
 # Study user attribute with the judge results, by trial number (as a string) and "baseline".
 JUDGE_SCORES_ATTR = "judge_scores"
@@ -248,7 +248,19 @@ def load_ranking_prompts(
         prompts = []
         with open(settings.judge_ranking_prompts_file, encoding="utf-8") as file:
             for index, line in enumerate(line for line in file if line.strip()):
-                row = json.loads(line)
+                # JSON Lines with id, category and prompt (the harness's .meta.jsonl), or one
+                # prompt per line: the Colab bundle carries the plain text sets, not the meta
+                # files, so a .txt has to work too. A text line that happens to be valid JSON
+                # is only taken as a row when it is an object with a prompt.
+                row = None
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict) and "prompt" in parsed:
+                    row = parsed
+                if row is None:
+                    row = {"prompt": line.strip()}
                 prompts.append(
                     RankingPrompt(
                         id=str(
@@ -419,6 +431,11 @@ def write_candidate_answers(
                     prompt=ranking_prompt.prompt.user,
                     response=response,
                     settings=run_settings,
+                    # The harness groups by holdout_version and treats a row without one as
+                    # hold-out v1, which these answers are not; it also reports rates per
+                    # language from lang.
+                    holdout_version=settings.judge_ranking_holdout_version,
+                    lang=detect_lang(ranking_prompt.prompt.user),
                     n_gen_tokens=len(ids),
                     finish="length"
                     if len(ids) >= settings.judge_ranking_response_length
