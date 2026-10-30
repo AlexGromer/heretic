@@ -21,7 +21,7 @@
 
 import json
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -30,7 +30,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
-from .judge import strip_cot
+from .judge import COT_BLOCKS, strip_cot
 from .model import (
     Model,
     ModuleIO,
@@ -46,6 +46,8 @@ class LabelledAnswer:
     prompt: str
     response: str
     label: str
+    # One-line reason the judge gave for the label; empty when the file has none.
+    reason: str = ""
 
 
 def _refusal_eval_key(row: dict[str, Any]) -> str:
@@ -85,19 +87,25 @@ def load_labelled_answers(
     """
     rows = _read_jsonl(responses_path)
     labels: dict[str, str] = {}
+    reasons: dict[str, str] = {}
     if judged_path is not None:
         for row in _read_jsonl(judged_path):
             label = row.get("label")
             if isinstance(label, str):
-                labels.setdefault(_refusal_eval_key(row), label)
+                key = _refusal_eval_key(row)
+                labels.setdefault(key, label)
+                if isinstance(row.get("reason"), str):
+                    reasons.setdefault(key, row["reason"])
 
     answers = []
     for row in rows:
-        label = (
-            labels.get(_refusal_eval_key(row))
-            if judged_path is not None
-            else row.get("judge_label", row.get("label"))
-        )
+        if judged_path is not None:
+            key = _refusal_eval_key(row)
+            label = labels.get(key)
+            if key in reasons:
+                row = {**row, "judge_reason": reasons[key]}
+        else:
+            label = row.get("judge_label", row.get("label"))
         if not isinstance(label, str) or "prompt" not in row or "response" not in row:
             continue
         system = row.get("system")
@@ -108,12 +116,14 @@ def load_labelled_answers(
                 if isinstance(settings, dict)
                 else default_system
             )
+        reason = row.get("judge_reason", row.get("reason", ""))
         answers.append(
             LabelledAnswer(
                 system=system if isinstance(system, str) else default_system,
                 prompt=str(row["prompt"]),
                 response=str(row["response"]),
                 label=label,
+                reason=str(reason) if isinstance(reason, str) else "",
             )
         )
     return answers
@@ -187,6 +197,36 @@ def answer_positions(
     return PositionedText(input_ids, positions or [len(input_ids) - 1])
 
 
+def thinking_positions(
+    model: Model, answer: LabelledAnswer, count: int
+) -> PositionedText | None:
+    """
+    The first `count` tokens inside the answer's reasoning block, or None when the answer
+    has none. Qwen3-style models decide there whether to answer (upstream issue #360), so a
+    direction taken here targets that decision rather than the written answer.
+    """
+    prompt_text = chat_text(model, answer.system, answer.prompt)
+    visible = strip_cot(answer.response)
+    thinking = answer.response
+    if visible:
+        cut = thinking.rfind(visible)
+        if cut >= 0:
+            thinking = thinking[:cut]
+    # Strip the delimiters themselves, so only the reasoning text is used.
+    for initializer, finalizer in COT_BLOCKS:
+        thinking = thinking.replace(initializer, " ").replace(finalizer, " ")
+    if not thinking.strip():
+        return None
+    text = prompt_text + thinking
+    input_ids, offsets = _encode(model, text)
+    positions = [
+        index
+        for index, (start, end) in enumerate(offsets)
+        if start >= len(prompt_text) and end > start
+    ][:count]
+    return PositionedText(input_ids, positions) if positions else None
+
+
 def instruction_end_position(model: Model, prompt: Prompt) -> PositionedText:
     """The last token of the user instruction, before the post-instruction template tokens."""
     text = chat_text(model, prompt.system, prompt.user)
@@ -229,6 +269,26 @@ def _forward(
             use_cache=False,
             **kwargs,
         )
+
+
+def forced_logits(
+    model: Model, items: Sequence[PositionedText]
+) -> Iterator[tuple[int, Tensor]]:
+    """
+    Teacher-forces the items and yields (item index, logits at its positions) one item at a
+    time, so a consumer can reduce them before the next batch allocates its own logits.
+    The logits are float32 on the CPU, of shape (positions, vocabulary).
+    """
+    index = 0
+    for batch in batchify(list(items), model.settings.batch_size):
+        input_ids, attention_mask, positions = _pad(model, batch)
+        outputs = _forward(model, input_ids, attention_mask)
+        logits = outputs.logits
+        for row, row_positions in enumerate(positions):
+            selected = torch.tensor(row_positions, device=logits.device)
+            yield index, logits[row].index_select(0, selected).to(torch.float32).cpu()
+            index += 1
+        del outputs, logits
 
 
 def hidden_state_means(model: Model, items: Sequence[PositionedText]) -> Tensor:

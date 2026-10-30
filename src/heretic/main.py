@@ -81,6 +81,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.traceback import install
 
+from .benchmarks import benchmark_trials, format_benchmarks
 from .config import (
     DatasetSpecification,
     ExportStrategy,
@@ -873,6 +874,11 @@ def run():
             sorted_trials = rank_by_judge(sorted_trials, judge_scores)
             judge_labels = get_judge_settings(settings).labels if judge_scores else []
 
+            # Fork addition: capability benchmarks for the same candidates.
+            benchmark_scores = benchmark_trials(
+                study, sorted_trials, settings, model, modifier
+            )
+
             def format_trial_title(trial: FrozenTrial) -> str:
                 prefix = f"[Trial {trial.user_attrs['index']:>3}]"
                 merged_displays = {
@@ -897,6 +903,10 @@ def run():
                     score_parts.append(
                         f"Judge: {format_judge_record(judged, judge_labels)}"
                     )
+
+                benchmarked = benchmark_scores.get(str(trial.number))
+                if benchmarked:
+                    score_parts.append(format_benchmarks(benchmarked))
 
                 return f"{prefix} " + ", ".join(score_parts)
 

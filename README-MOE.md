@@ -460,3 +460,72 @@ To keep each job in one place:
   `config.orbench.toml` reads `refusal-eval/val/orbench_val.txt` (a seeded Hub sample shared 8 of 100 prompts with the
   hold-out monitor).
 * **heretic-colab-pipeline** runs both in Colab (configs, Drive layout, loop, stages).
+
+# v7: metrics that see more, and more levers
+
+Same fork, branch `metrics-depth`. Everything is off by default. Tests: `tests/test_v7.py`
+(CPU, tiny models). Nothing here was run on a GPU or on a real model, so the effect on refusals,
+PARTIAL and capabilities is unmeasured.
+
+## 1. KL over an answer, not only its first token
+
+`heretic.scorers.sequence_kl.SequenceKLDivergence`: the built-in KL compares the distribution of
+the FIRST generated token on harmless prompts, so damage that only shows later in an answer never
+enters it. This records, once on the original model, the greedy continuation of every prompt
+(`tokens`, default 32) with the original distributions along it, and measures the divergence at the
+same positions by teacher forcing. Only the `top_k` (default 128) most likely original tokens are
+kept per position, with both sides renormalized over that support; the covered share of the
+original mass is printed at startup (normally above 0.99). The display also names the worst prompt,
+since a mean hides a single derailed answer. Cost: one forward pass over prompt + `tokens`.
+
+## 2. Capability benchmarks on the candidates
+
+`judge_ranking_benchmarks = ["gsm8k:exact_match,strict-match", "mmlu"]` runs those lm-eval tasks on
+the original model and on the trials the judge ranking already looks at, prints each candidate's
+difference from the original model, and stores the numbers in the study. The `BenchmarkScore`
+scorer runs on every trial, which GSM8K cannot afford; this runs on the few finalists. Motivation:
+arXiv 2512.13655 reports GSM8K changes from +1.51 to -18.81 points across tools and models.
+
+## 3. Directions where the evasion is, by language and by kind
+
+All three add a slot in the same mechanism as v5/v6 (orthonormal to the classic direction, the good
+direction and each other, each with its own weight in `direction_weight_range`):
+
+* `language_directions = true`: the bad prompts are split by script (`ru` / `en`, the same rule as
+  refusal-eval's `detect_lang`), and every language with at least `language_min_prompts` prompts
+  gets its own direction. The classic direction is dominated by whichever language most of the
+  prompts are in - in `train/bad_train` 436 of 612 prompts are Russian while `harmful_behaviors` is
+  English.
+* `response_subtype_patterns`: the judge writes a one-line reason for every label, so the
+  non-answers can be split by it ("general overview", "asks for clarification", "educational
+  pivot") and each kind gets its own direction instead of one for all of them. A kind with fewer
+  than `response_subtype_min_answers` matching answers is skipped.
+* `response_thinking_direction = true`: a direction from the tokens inside the reasoning blocks of
+  the judged answers. Thinking models decide there whether to answer (upstream #360). Answers
+  without a reasoning block are skipped.
+
+## 4. Router pre-bias per layer, and Gemma 4
+
+* `router_bias_per_layer = true` searches one alpha per MoE layer (`router_bias_alpha.<layer>`)
+  instead of one for all of them. An alpha of 0 leaves a layer's router untouched, so the search
+  can pick a subset of layers, as the best result in upstream #322 did (four layers, different
+  alphas). One search parameter per MoE layer, so raise `n_trials` with it.
+* Gemma 4 text keeps its experts and router on the decoder layer (`layer.experts`, `layer.router`)
+  instead of inside an MLP block, and the router holds its projection in a child module
+  (`router.proj`) behind an RMS norm. Both are found now, and the bias is folded into that
+  projection, whose recorded inputs are what the weight multiplies. The expert layout is the one
+  EGA already supports (`gate_up_proj` / `down_proj` / `act_fn`), so EGA covers Gemma 4 MoE too -
+  verified against the Transformers 5.20.2 source and a stub of that layout, not on the real model.
+
+## 5. Optimizing non-answers, and several studies
+
+`config.judge-objective.toml` makes `ClassifierRate` (the classifier distilled from the judge) the
+objective instead of the keyword counter, with both KL scorers beside it and the keyword counter
+kept for comparison. Its header has the order of the prerequisites (judged answers, judge
+calibration kappa >= 0.75, trained classifier) and the recipe for running two or three independent
+studies into separate `study_checkpoint_dir` journals and comparing their candidates with
+refusal-eval `compare_runs.py`; TPE runs differ a lot (upstream #88, #202), while more trials in one
+study do not bring refusals down by themselves (#404).
+
+Not done here: wiring the two-stage selection, the new fork patch and `--trial-number` into
+heretic-colab-pipeline (that repository is being changed elsewhere).

@@ -154,8 +154,17 @@ def _collapse_flattened_residual_streams(
 # Granite MoE stores them as the "weight" of an "output_linear" module instead.
 FUSED_DOWN_PROJECTION_NAMES = ("down_proj", "w2")
 
-# The attributes of a decoder layer that can hold a MoE block.
-MOE_BLOCK_NAMES = ("mlp", "block_sparse_moe", "moe", "feed_forward")
+# The attributes of a decoder layer that can hold a MoE block. "experts" and "router"
+# are there for models that keep them directly on the layer instead of inside an MLP
+# block (e.g. Gemma 4 text: layer.experts, layer.router).
+MOE_BLOCK_NAMES = (
+    "mlp",
+    "block_sparse_moe",
+    "moe",
+    "feed_forward",
+    "experts",
+    "router",
+)
 
 # The component whose Optuna parameters (max_weight etc.) are reused for fused experts.
 FUSED_EXPERTS_WEIGHT_COMPONENT = "mlp.down_proj"
@@ -841,6 +850,8 @@ class Model:
         )
 
         found: dict[str, list[FusedExperts]] = {}
+        # A layer can expose the same module under two attributes; keep one entry.
+        seen: set[tuple[int, str]] = set()
 
         for block_name in MOE_BLOCK_NAMES:
             block = getattr(layer, block_name, None)
@@ -862,6 +873,10 @@ class Model:
                     )
                     if not is_down_projection:
                         continue
+
+                    if (id(module), parameter_name) in seen:
+                        continue
+                    seen.add((id(module), parameter_name))
 
                     path = ".".join(
                         part

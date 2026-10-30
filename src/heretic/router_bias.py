@@ -30,7 +30,13 @@ from .model import Model, ParameterHandle
 from .utils import Prompt, batchify
 
 ROUTER_ATTRIBUTES = ("gate", "router")
-MOE_BLOCK_ATTRIBUTES = ("mlp", "block_sparse_moe", "moe", "feed_forward")
+# Containers of the router on a decoder layer; "" is the layer itself, for models that keep
+# the router there instead of inside an MLP block (e.g. Gemma 4 text: layer.router).
+MOE_BLOCK_ATTRIBUTES = ("mlp", "block_sparse_moe", "moe", "feed_forward", "")
+# A router that normalizes its input before the projection keeps the projection in a child
+# module (Gemma 4: router.proj). The weight is then edited there, and the inputs are
+# recorded at that child, so the fold is calibrated on what actually multiplies the weight.
+ROUTER_PROJECTION_ATTRIBUTES = ("proj", "linear", "gate_proj")
 
 # Number of router inputs per layer kept to measure the spread of the weight fold.
 SAMPLE_ROWS = 512
@@ -39,8 +45,10 @@ SAMPLE_ROWS = 512
 @dataclass
 class Router:
     layer_index: int
-    # Path of the router module relative to the decoder layer, e.g. "mlp.gate".
+    # Path of the module that owns the weight, relative to the decoder layer
+    # (e.g. "mlp.gate" for Qwen3.5 MoE, "router.proj" for Gemma 4 text).
     path: str
+    # The module that owns the weight; its recorded inputs are what the weight multiplies.
     module: Module
     num_experts: int
     top_k: int
@@ -70,38 +78,66 @@ class RouterBiasPlan:
     projection_spread: float
 
 
+def _weight_owner(module: Module) -> tuple[Module, str] | None:
+    """The module that owns the (experts, hidden) weight: the router itself or its projection."""
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, Tensor) and weight.dim() == 2:
+        return module, ""
+    for name in ROUTER_PROJECTION_ATTRIBUTES:
+        child = getattr(module, name, None)
+        child_weight = getattr(child, "weight", None)
+        if (
+            isinstance(child, Module)
+            and isinstance(child_weight, Tensor)
+            and child_weight.dim() == 2
+        ):
+            return child, name
+    return None
+
+
 def find_router(model: Model, layer_index: int) -> Router | None:
     """
-    The router of a MoE layer: a module named gate/router in the layer's MoE block whose
-    `weight` has shape (experts, hidden size), or None for dense layers.
+    The router of a MoE layer: a module named gate/router on the layer or in its MoE block,
+    whose weight (its own, or that of a projection child such as Gemma 4's `router.proj`)
+    has shape (experts, hidden size). None for dense layers.
     """
     layer = model.get_layers()[layer_index]
-    config = model.model.config
-    text_config = getattr(config, "text_config", None) or config
-    hidden_size = getattr(text_config, "hidden_size", None)
-    top_k = getattr(text_config, "num_experts_per_tok", None)
+    config = model.model.config.get_text_config()
+    hidden_size = getattr(config, "hidden_size", None)
+    top_k = getattr(config, "num_experts_per_tok", None) or getattr(
+        config, "top_k_experts", None
+    )
 
     for block_name in MOE_BLOCK_ATTRIBUTES:
-        block = getattr(layer, block_name, None)
+        block = layer if block_name == "" else getattr(layer, block_name, None)
         if not isinstance(block, Module):
             continue
         for router_name in ROUTER_ATTRIBUTES:
             module = getattr(block, router_name, None)
-            weight = getattr(module, "weight", None)
-            if not isinstance(module, Module) or not isinstance(weight, Tensor):
+            if not isinstance(module, Module):
                 continue
-            if weight.dim() != 2 or weight.shape[1] != hidden_size:
+            owner = _weight_owner(module)
+            if owner is None:
+                continue
+            weight_module, child_name = owner
+            weight = cast(Tensor, cast(Any, weight_module).weight)
+            if weight.shape[1] != hidden_size:
                 continue
             if not weight.is_floating_point():
                 # Quantized (e.g. bitsandbytes 4-bit) routers cannot be edited directly.
                 return None
-            k = getattr(module, "top_k", None) or top_k
+            k = (
+                getattr(module, "top_k", None)
+                or getattr(module, "top_k_experts", None)
+                or top_k
+            )
             if not isinstance(k, int) or not 1 <= k < weight.shape[0]:
                 continue
+            path = ".".join(p for p in (block_name, router_name, child_name) if p)
             return Router(
                 layer_index=layer_index,
-                path=f"{block_name}.{router_name}",
-                module=module,
+                path=path,
+                module=weight_module,
                 num_experts=weight.shape[0],
                 top_k=k,
             )

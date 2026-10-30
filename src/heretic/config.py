@@ -484,6 +484,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    judge_ranking_benchmarks: list[str] = Field(
+        default=[],
+        description=(
+            "Benchmarks to run on the original model and on the ranked candidate trials after "
+            "the optimization (fork addition), as task IDs of the Language Model Evaluation "
+            'Harness, optionally with the metric: ["gsm8k:exact_match,strict-match", "mmlu"]. '
+            "Abliteration can cost capabilities, and the BenchmarkScore scorer is too slow to "
+            "run on every trial. Empty disables it; the results are stored in the study and "
+            "shown next to the judged trials."
+        ),
+    )
+
     judge_ranking_output: str | None = Field(
         default=None,
         description=(

@@ -152,6 +152,14 @@ judge_ranking_set = "bad_eval"
 judge_ranking_response_length = 512
 judge_ranking_batch_size = 0
 
+# Capability benchmarks (Language Model Evaluation Harness task IDs, optionally "task:metric")
+# to run on the original model and on the ranked candidate trials after the optimization
+# (fork addition). Abliteration can cost capabilities (arXiv 2512.13655 reports GSM8K changes
+# from +1.51 to -18.81 points), and the BenchmarkScore scorer is too slow to run on every trial.
+# A benchmark takes far longer than an evaluation; the results are stored in the study.
+# judge_ranking_benchmarks = ["gsm8k:exact_match,strict-match", "mmlu"]
+judge_ranking_benchmarks = []
+
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 
@@ -377,6 +385,26 @@ split = "test[:100]"
 column = "text"
 
 
+# KL divergence over the first tokens of an answer instead of its first token (fork addition):
+# add it as { plugin = "heretic.scorers.sequence_kl.SequenceKLDivergence", optimization = "minimize" }
+# (or "none" to only watch it). The built-in KLDivergence compares the FIRST generated token only,
+# so damage that shows later in an answer does not enter it. This records the original model's
+# greedy continuation once and compares the distributions along it (teacher forcing).
+[scorer.SequenceKLDivergence]
+score_name = "Sequence KL"
+
+# Number of compared tokens, and how many of the original distribution's most likely tokens are
+# kept per position (the divergence is computed on that support, renormalized; the covered share
+# of the original mass is printed at startup, normally above 0.99).
+tokens = 32
+top_k = 128
+
+[scorer.SequenceKLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+
 # Share of non-answers according to a classifier distilled from the judge (fork addition):
 # train it with heretic-train-classifier on judged answers, then use it as an objective,
 # { plugin = "heretic.scorers.classifier_rate.ClassifierRate", optimization = "minimize" },
@@ -576,6 +604,12 @@ som_sigma = 0.5
 router_bias = false
 router_bias_alpha_range = [0.0, 1.0]
 
+# Search one alpha per MoE layer (parameters router_bias_alpha.<layer>) instead of one for all
+# layers. The best result in issue #322 used four layers with different alphas, and an alpha of 0
+# leaves a layer untouched, so the search can pick a subset. One search parameter per MoE layer,
+# so raise n_trials with it.
+router_bias_per_layer = false
+
 # Number of positions at the end of each prompt whose routing decisions are counted.
 router_bias_last_positions = 4
 
@@ -592,6 +626,28 @@ response_bad_labels = ["PARTIAL"]
 response_good_labels = ["COMPLY"]
 response_tokens = 32
 response_max_samples = 200
+
+# One response direction per kind of non-answer (fork addition): the judge writes a one-line
+# reason for every label, and the answers whose reason matches a pattern (case insensitive
+# regular expression) give that subtype its own direction and weight, instead of one direction
+# for all non-answers. A subtype with fewer matching answers than response_subtype_min_answers
+# is skipped.
+# [modifier.Abliteration.response_subtype_patterns]
+# overview = "general|overview|high.level|vague"
+# clarify = "clarif|authoriz|context|more information"
+# pivot = "defens|educat|theory|history|instead"
+response_subtype_min_answers = 10
+
+# An additional direction from the tokens INSIDE the reasoning blocks of the judged answers
+# (needs response_direction_file): thinking models decide there whether to answer (issue #360).
+response_thinking_direction = false
+
+# One additional direction per prompt language (fork addition): the bad prompts are split by
+# script (ru / en) and each language with at least language_min_prompts prompts gets its own
+# direction and weight. The classic direction is dominated by the language most prompts are in,
+# which matters when the training prompts are mostly in one language and the evaluation is not.
+language_directions = false
+language_min_prompts = 20
 
 # Harmfulness direction of Zhao et al. 2025 (arXiv 2507.11878): bad minus good prompts at the last
 # token of the user instruction (refusal is read after the post-instruction template tokens),

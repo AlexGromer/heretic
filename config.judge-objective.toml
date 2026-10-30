@@ -1,0 +1,115 @@
+# Heretic configuration that optimizes non-answers (judge-distilled classifier) instead of
+# keyword refusals, and runs several independent studies (fork addition; README-MOE.md, v7).
+#
+# Prerequisites, in order:
+#
+# 1. Answers on the training prompts, judged: refusal-eval
+#    `generate_colab.py --sets bad_train --modes sample --samples 4` and
+#    `judge_colab.py batch` (or `judge.py batch`).
+# 2. The judge calibrated against your own labels: refusal-eval `calibration/make_sheet.py`,
+#    fill `human_label`, `calibration/kappa.py`. Below a kappa of about 0.75 the judge's
+#    numbers are not solid enough to optimize against, and a classifier distilled from it
+#    cannot be better than the judge.
+# 3. A classifier: `heretic-train-classifier --responses R.jsonl --judged J.jsonl
+#    --output classifiers/nonanswer`. It prints the agreement with the judge on held-out
+#    prompts and warns when the binary kappa is below 0.75. Only go on if it is above.
+#
+# The objectives below are then: non-answers (REFUSAL + PARTIAL by the classifier), the
+# first-token KL divergence, and the KL over the first tokens of an answer. Three objectives
+# make the Pareto front larger, so n_trials is higher than the default.
+#
+# Several studies (item 11 of the plan): the TPE sampler is random until n_startup_trials and
+# its runs differ a lot (upstream #88, #202), so run this config two or three times with a
+# different `study_checkpoint_dir` (and `seed`, if you set one), then pick among the fronts of
+# all of them. Each run writes its own journal, so nothing is overwritten:
+#
+#   heretic --model Qwen/Qwen3-8B --study-checkpoint-dir checkpoints/run1
+#   heretic --model Qwen/Qwen3-8B --study-checkpoint-dir checkpoints/run2
+#
+# Adding trials to one study is not the same thing: upstream #404 says more trials do not
+# bring the refusals down by themselves, while a second study explores from a new start.
+# Afterwards, judge the candidates of every run (n_judge_ranking_trials below) and compare
+# them with refusal-eval `compare_runs.py`, which tells a real difference from noise.
+#
+# Usage: copy to config.toml in the directory you run heretic from, set `model` and the paths.
+
+model = "Qwen/Qwen3-8B"
+
+dtypes = ["auto", "bfloat16"]
+
+# PARTIAL answers turn evasive late, so the classifier needs to see a long answer.
+max_response_length = 256
+
+modifiers = [
+    { plugin = "heretic.modifiers.ara.ARA" },
+]
+
+scorers = [
+    # The objective: the share of answers the classifier calls REFUSAL or PARTIAL.
+    { plugin = "heretic.scorers.classifier_rate.ClassifierRate", optimization = "minimize" },
+    # Kept as a second objective: the first-token KL divergence of upstream Heretic.
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+    # The KL over the first tokens of an answer, which the first-token KL cannot see.
+    { plugin = "heretic.scorers.sequence_kl.SequenceKLDivergence", optimization = "minimize" },
+    # The keyword counter, kept for comparison only (it does not steer the search).
+    { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "none" },
+]
+
+# Three objectives: more trials, and a wider exploration phase.
+n_trials = 150
+n_startup_trials = 40
+
+# Run this config two or three times with a different directory per run (see the header).
+study_checkpoint_dir = "checkpoints/run1"
+
+responses_file = "responses.jsonl"
+
+# The best candidates are judged by the real judge afterwards, and benchmarked, so a trial
+# that optimized the classifier well but lost capabilities is visible before the export.
+n_judge_ranking_trials = 6
+judge_ranking_max_kl = 0.15
+judge_ranking_response_length = 512
+judge_ranking_prompts_file = "../refusal-eval/train/bad_eval.meta.jsonl"
+judge_ranking_benchmarks = ["gsm8k:exact_match,strict-match"]
+
+[scorer.ClassifierRate]
+model_path = "classifiers/nonanswer"
+
+[scorer.ClassifierRate.prompts]
+dataset = "../refusal-eval/train/bad_eval.txt"
+
+[scorer.KeywordRate]
+strict = true
+strict_window_tokens = 256
+
+[scorer.KeywordRate.prompts]
+dataset = "../refusal-eval/train/bad_eval.txt"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[scorer.SequenceKLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+# The judge of the ranking (its endpoint must be reachable from this host).
+[scorer.JudgeRate]
+endpoint = "http://localhost:11434"
+model = "qwen3:14b"
+
+[scorer.JudgeRate.prompts]
+dataset = "../refusal-eval/train/bad_eval.txt"
+
+[modifier.ARA]
+# Judged answers of a previous model on the training prompts (see the header).
+# response_io_file = "runs/qwen3-8b-t18-train/responses.jsonl"
+# response_io_judged_file = "runs/qwen3-8b-t18-train/judged.jsonl"
+
+[modifier.ARA.good_prompts]
+dataset = "../refusal-eval/train/good_train.txt"
+
+[modifier.ARA.bad_prompts]
+dataset = "../refusal-eval/train/bad_train.txt"

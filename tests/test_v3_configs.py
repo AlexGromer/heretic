@@ -11,7 +11,9 @@ from typing import Any, cast
 from heretic.config import Settings
 from heretic.modifiers.abliteration import Abliteration
 from heretic.modifiers.ara import ARA
+from heretic.scorers.classifier_rate import ClassifierRate
 from heretic.scorers.keyword_rate import KeywordRate
+from heretic.scorers.sequence_kl import SequenceKLDivergence
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -35,6 +37,7 @@ class ExampleConfigTests(unittest.TestCase):
 
         for plugin_class, namespace in (
             (KeywordRate, "scorer"),
+            (SequenceKLDivergence, "scorer"),
             (ARA, "modifier"),
             (Abliteration, "modifier"),
         ):
@@ -48,6 +51,7 @@ class ExampleConfigTests(unittest.TestCase):
         config = self.check("config.default.toml")
         for plugin_class, namespace in (
             (KeywordRate, "scorer"),
+            (SequenceKLDivergence, "scorer"),
             (ARA, "modifier"),
             (Abliteration, "modifier"),
         ):
@@ -94,6 +98,13 @@ class ExampleConfigTests(unittest.TestCase):
                 "response_tokens",
                 "response_max_samples",
                 "harmfulness_direction",
+                "response_subtype_min_answers",
+                "response_thinking_direction",
+                "language_directions",
+                "language_min_prompts",
+                "router_bias_per_layer",
+                "tokens",
+                "top_k",
             ):
                 if hasattr(defaults, key):
                     self.assertEqual(
@@ -133,6 +144,22 @@ class ExampleConfigTests(unittest.TestCase):
         settings = ARA.validate_settings(ARA.get_settings_raw(config, "modifier", None))
         assert settings is not None
         self.assertEqual(cast(Any, settings).response_bad_labels, ["PARTIAL"])
+
+    def test_judge_objective_config(self) -> None:
+        config = self.check("config.judge-objective.toml")
+        plugins = [scorer["plugin"] for scorer in config["scorers"]]
+        self.assertIn("heretic.scorers.classifier_rate.ClassifierRate", plugins)
+        self.assertIn("heretic.scorers.sequence_kl.SequenceKLDivergence", plugins)
+        # The keyword counter is kept for comparison only.
+        keyword = next(
+            s for s in config["scorers"] if s["plugin"].endswith("KeywordRate")
+        )
+        self.assertEqual(keyword["optimization"], "none")
+        settings = ClassifierRate.validate_settings(
+            ClassifierRate.get_settings_raw(config, "scorer", None)
+        )
+        assert settings is not None
+        self.assertEqual(cast(Any, settings).model_path, "classifiers/nonanswer")
 
     def test_moe_ega_config(self) -> None:
         config = self.check("config.moe-ega.toml")

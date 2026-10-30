@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, cast
@@ -33,12 +34,17 @@ from heretic.ega import (
     ablate_fused_experts_per_expert,
     build_ega_plans,
 )
-from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT
+from heretic.judge import strip_cot
+from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT, Model
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.positions import (
+    answer_positions,
     instruction_end_position,
     load_answer_items,
+    load_labelled_answers,
     position_direction,
+    split_answers,
+    thinking_positions,
 )
 from heretic.ranges import check_range
 from heretic.router_bias import (
@@ -46,7 +52,7 @@ from heretic.router_bias import (
     apply_router_bias,
     build_router_bias_plans,
 )
-from heretic.utils import format_dataset_specification, print
+from heretic.utils import detect_lang, format_dataset_specification, print
 
 
 @dataclass
@@ -66,6 +72,9 @@ class Parameters(Serializable):
     # router pre-bias (see Settings.router_bias).
     direction_weights: list[float] = field(default_factory=list)
     router_bias_alpha: float = 0.0
+    # Per-layer router strengths (layer index as a string -> alpha), used instead of
+    # router_bias_alpha when router_bias_per_layer is on.
+    router_bias_alphas: dict[str, float] = field(default_factory=dict)
     # Names of the additional directions, aligned with direction_weights
     # (e.g. "direction_1", "partial_direction", "harmfulness_direction").
     direction_names: list[str] = field(default_factory=list)
@@ -94,7 +103,12 @@ class Parameters(Serializable):
             )
             parameters[f"{name}.weight"] = f"{weight:.2f}"
 
-        if self.router_bias_alpha:
+        for layer, alpha in sorted(
+            self.router_bias_alphas.items(), key=lambda item: int(item[0])
+        ):
+            parameters[f"router_bias_alpha.{layer}"] = f"{alpha:.2f}"
+
+        if self.router_bias_alpha and not self.router_bias_alphas:
             parameters["router_bias_alpha"] = f"{self.router_bias_alpha:.2f}"
 
         return parameters
@@ -111,6 +125,7 @@ class Parameters(Serializable):
             },
             direction_weights=list(data.get("direction_weights", [])),
             router_bias_alpha=data.get("router_bias_alpha", 0.0),
+            router_bias_alphas=dict(data.get("router_bias_alphas", {})),
             direction_names=list(data.get("direction_names", [])),
         )
 
@@ -377,6 +392,50 @@ class Settings(BaseModel):
         description="Maximum number of answers per side (a fixed random subset is used beyond).",
     )
 
+    response_subtype_patterns: dict[str, str] = Field(
+        default={},
+        description=(
+            "Additional response directions per kind of non-answer (fork addition): "
+            '{ "overview" = "general|overview|high-level", "clarify" = "clarif|authoriz" }. '
+            "The judge writes a one-line reason for every label; the answers of "
+            "response_bad_labels whose reason matches a pattern (case insensitive regular "
+            "expression) give that subtype its own direction and weight, instead of one "
+            "direction for all non-answers. A subtype with fewer than "
+            "response_subtype_min_answers matching answers is skipped."
+        ),
+    )
+
+    response_subtype_min_answers: PositiveInt = Field(
+        default=10,
+        description="Minimum number of matching answers for a subtype to get its own direction.",
+    )
+
+    response_thinking_direction: bool = Field(
+        default=False,
+        description=(
+            "An additional direction from the tokens inside the reasoning block of judged "
+            "answers (fork addition, needs response_direction_file): thinking models decide "
+            "there whether to answer (upstream issue #360). Answers without a reasoning block "
+            "are skipped; with none of them the direction is left out."
+        ),
+    )
+
+    language_directions: bool = Field(
+        default=False,
+        description=(
+            "An additional direction per prompt language (fork addition): the bad prompts are "
+            "split by script (ru / en) and each language with at least "
+            "language_min_prompts prompts gets its own direction and weight, on top of the "
+            "classic direction over all of them. The classic direction is dominated by the "
+            "language most of the prompts are in."
+        ),
+    )
+
+    language_min_prompts: PositiveInt = Field(
+        default=20,
+        description="Minimum number of prompts of a language for its own direction.",
+    )
+
     harmfulness_direction: bool = Field(
         default=False,
         description=(
@@ -402,6 +461,17 @@ class Settings(BaseModel):
     router_bias_alpha_range: tuple[float, float] = Field(
         default=(0.0, 1.0),
         description="Range of the strength alpha of the router pre-bias.",
+    )
+
+    router_bias_per_layer: bool = Field(
+        default=False,
+        description=(
+            "Search one alpha per MoE layer (parameters router_bias_alpha.<layer>) instead of "
+            "one for all of them. The best result reported in upstream issue #322 used four "
+            "layers with different alphas, and an alpha of 0 leaves a layer's router untouched, "
+            "so the search can pick a subset of layers. Costs one search parameter per MoE "
+            "layer, so raise n_trials accordingly."
+        ),
     )
 
     router_bias_last_positions: PositiveInt = Field(
@@ -621,6 +691,31 @@ class Abliteration(Modifier[Parameters]):
                 for index in range(1, self.settings.direction_count)
             )
 
+        if self.settings.language_directions:
+            languages: dict[str, list] = {}
+            for prompt in bad_prompts:
+                languages.setdefault(detect_lang(prompt.user), []).append(prompt)
+            for language, prompts in sorted(languages.items()):
+                if len(prompts) < self.settings.language_min_prompts:
+                    print(
+                        f"* Language [bold]{language}[/]: only {len(prompts)} bad prompts, "
+                        "no direction of its own"
+                    )
+                    continue
+                print(
+                    f"* Obtaining the direction of language [bold]{language}[/] "
+                    f"from {len(prompts)} bad prompts..."
+                )
+                language_means = model.get_residuals_mean(
+                    prompts,
+                    winsorization_quantile=self.settings.winsorization_quantile,
+                )
+                self._add_extra_direction(
+                    f"language_{language}_direction",
+                    F.normalize(language_means - good_means, p=2, dim=1),
+                    good_means,
+                )
+
         if self.settings.response_direction_file is not None:
             print("* Obtaining the response direction from judged answers...")
             bad_items, good_items = load_answer_items(
@@ -637,6 +732,8 @@ class Abliteration(Modifier[Parameters]):
                 position_direction(model, bad_items, good_items),
                 good_means,
             )
+            self._add_subtype_directions(model, good_items, good_means)
+            self._add_thinking_direction(model, good_means)
 
         if self.settings.harmfulness_direction:
             print("* Obtaining the harmfulness direction at the instruction end...")
@@ -733,6 +830,87 @@ class Abliteration(Modifier[Parameters]):
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
         model.apply_lora(self.lora_rank)
+
+    def _load_answers(self, model: Model) -> list:
+        """The judged answers of response_direction_file (with their judge reasons)."""
+        assert self.settings.response_direction_file is not None
+        return load_labelled_answers(
+            self.settings.response_direction_file,
+            self.settings.response_direction_judged_file,
+            model.settings.system_prompt,
+        )
+
+    def _add_subtype_directions(
+        self, model: Model, good_items: list, good_means: Tensor
+    ) -> None:
+        """One direction per kind of non-answer, by the judge's reason (fork addition)."""
+        if not self.settings.response_subtype_patterns:
+            return
+
+        answers = self._load_answers(model)
+        for name, pattern in sorted(self.settings.response_subtype_patterns.items()):
+            expression = re.compile(pattern, re.IGNORECASE)
+            matching = [
+                answer
+                for answer in answers
+                if answer.label in self.settings.response_bad_labels
+                and expression.search(answer.reason)
+                and strip_cot(answer.response)
+            ]
+            if len(matching) < self.settings.response_subtype_min_answers:
+                print(
+                    f"* Subtype [bold]{name}[/]: only {len(matching)} answers match "
+                    f"{pattern!r}, no direction of its own"
+                )
+                continue
+            items = [
+                answer_positions(model, answer, self.settings.response_tokens)
+                for answer in matching[: self.settings.response_max_samples]
+            ]
+            print(f"* Subtype [bold]{name}[/]: {len(items)} answers")
+            self._add_extra_direction(
+                f"{name}_direction",
+                position_direction(model, items, good_items),
+                good_means,
+            )
+
+    def _add_thinking_direction(self, model: Model, good_means: Tensor) -> None:
+        """A direction from the reasoning blocks of judged answers (fork addition)."""
+        if not self.settings.response_thinking_direction:
+            return
+
+        answers = self._load_answers(model)
+        bad, good = split_answers(
+            answers,
+            self.settings.response_bad_labels,
+            self.settings.response_good_labels,
+            self.settings.response_max_samples,
+        )
+
+        def items(selected: list) -> list:
+            positioned = [
+                thinking_positions(model, answer, self.settings.response_tokens)
+                for answer in selected
+            ]
+            return [item for item in positioned if item is not None]
+
+        bad_items, good_items = items(bad), items(good)
+        if not bad_items or not good_items:
+            print(
+                "* No thinking direction: the judged answers have no reasoning blocks "
+                f"({len(bad_items)} bad, {len(good_items)} good with one)"
+            )
+            return
+
+        print(
+            f"* Obtaining the thinking direction from {len(bad_items)} bad and "
+            f"{len(good_items)} good reasoning blocks..."
+        )
+        self._add_extra_direction(
+            "thinking_direction",
+            position_direction(model, bad_items, good_items),
+            good_means,
+        )
 
     def _add_extra_direction(
         self, name: str, directions: Tensor, good_means: Tensor
@@ -860,21 +1038,30 @@ class Abliteration(Modifier[Parameters]):
             for name in self.extra_direction_names
         ]
 
-        router_bias_alpha = (
-            trial.suggest_float(
+        router_bias_alpha = 0.0
+        router_bias_alphas: dict[str, float] = {}
+        if self.router_plans and self.settings.router_bias_per_layer:
+            router_bias_alphas = {
+                str(plan.router.layer_index): trial.suggest_float(
+                    f"router_bias_alpha.{plan.router.layer_index}",
+                    self.settings.router_bias_alpha_range[0],
+                    self.settings.router_bias_alpha_range[1],
+                )
+                for plan in self.router_plans
+            }
+        elif self.router_plans:
+            router_bias_alpha = trial.suggest_float(
                 "router_bias_alpha",
                 self.settings.router_bias_alpha_range[0],
                 self.settings.router_bias_alpha_range[1],
             )
-            if self.router_plans
-            else 0.0
-        )
 
         return Parameters(
             direction_index=direction_index,
             weight_distributions=weight_distributions,
             direction_weights=direction_weights,
             router_bias_alpha=router_bias_alpha,
+            router_bias_alphas=router_bias_alphas,
             direction_names=list(self.extra_direction_names),
         )
 
@@ -1163,9 +1350,16 @@ class Abliteration(Modifier[Parameters]):
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
 
-        # Router pre-bias (fork addition, #322): the same strength for every MoE layer.
+        # Router pre-bias (fork addition, #322): one strength for every MoE layer, or one
+        # per layer with router_bias_per_layer (an alpha of 0 leaves that router untouched).
         for router_plan in self.router_plans:
-            apply_router_bias(model, router_plan, parameters.router_bias_alpha)
+            apply_router_bias(
+                model,
+                router_plan,
+                parameters.router_bias_alphas.get(
+                    str(router_plan.router.layer_index), parameters.router_bias_alpha
+                ),
+            )
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()

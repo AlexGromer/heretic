@@ -242,6 +242,43 @@ def load_ranking_prompts(
     ]
 
 
+@contextmanager
+def trial_model(
+    settings: Settings,
+    model: Model,
+    modifier: Modifier[Any],
+    ctx: Context,
+    trial: FrozenTrial | None,
+):
+    """
+    Puts the original model (trial None) or a trial's model in place for the duration of
+    the block. With judge_ranking_merged the trial is merged into the weights in memory,
+    so what is measured is what an export contains (the live LoRA rounds differently,
+    upstream #490). Without quantization, merging consumes the live model (needs_reload is
+    set), so the next reset reloads it.
+    """
+    modifier.reset_model(ctx)
+    if trial is not None:
+        modifier.modify_model(
+            ctx,
+            modifier.parameters_class.from_dict(trial.user_attrs["parameters"]),
+        )
+
+    if trial is None or not settings.judge_ranking_merged:
+        yield model
+        return
+
+    merged = model.get_merged_model()
+    live = model.model
+    model.model = merged
+    try:
+        yield model
+    finally:
+        model.model = live
+        del merged
+        empty_cache()
+
+
 def generate_answers(
     settings: Settings,
     model: Model,
@@ -251,33 +288,15 @@ def generate_answers(
     prompts: list[Prompt],
 ) -> list[str]:
     """Answers of the original model (trial None) or of a trial, at the ranking length."""
-    modifier.reset_model(ctx)
-    if trial is not None:
-        modifier.modify_model(
-            ctx,
-            modifier.parameters_class.from_dict(trial.user_attrs["parameters"]),
-        )
-    with generation_settings(
-        settings,
-        settings.judge_ranking_response_length,
-        settings.judge_ranking_batch_size,
+    with (
+        trial_model(settings, model, modifier, ctx, trial),
+        generation_settings(
+            settings,
+            settings.judge_ranking_response_length,
+            settings.judge_ranking_batch_size,
+        ),
     ):
-        if trial is None or not settings.judge_ranking_merged:
-            return model.get_responses_batched(prompts, skip_special_tokens=True)
-
-        # The live LoRA rounds differently than the merged weights that an export
-        # contains (#490), so merge in memory and generate with the merged model.
-        # Without quantization, merging consumes the live model (needs_reload is set),
-        # and the next reset reloads it.
-        merged = model.get_merged_model()
-        live = model.model
-        model.model = merged
-        try:
-            return model.get_responses_batched(prompts, skip_special_tokens=True)
-        finally:
-            model.model = live
-            del merged
-            empty_cache()
+        return model.get_responses_batched(prompts, skip_special_tokens=True)
 
 
 def write_candidate_answers(
