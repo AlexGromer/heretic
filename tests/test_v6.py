@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# Tests of the v6 additions against PARTIAL answers: the refusal-eval judge protocol, judge
+# Tests of the v6 additions against PARTIAL answers: the harness judge protocol, judge
 # re-ranking of trials, answer positions and judged-answer I/O, extra direction slots, the KL
 # mask for -inf logits, the distilled classifier and the DPO pair tools.
 # CPU only; some tests download tiny models from the Hugging Face Hub.
@@ -9,6 +9,7 @@
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -59,7 +60,13 @@ from heretic.scorers.judge_rate import Settings as JudgeSettings
 from heretic.scorers.kl_divergence import kl_divergence_batchmean
 from heretic.utils import Prompt
 
-REFUSAL_EVAL = Path(__file__).resolve().parent.parent.parent / "refusal-eval"
+# Optional cross-check against the evaluation harness, when a checkout of it is next to this
+# repository or HERETIC_HARNESS_DIR points at one. The fork itself does not depend on it; the
+# tests that use it skip when it is absent.
+HARNESS_DIR = Path(
+    os.environ.get("HERETIC_HARNESS_DIR")
+    or Path(__file__).resolve().parent.parent.parent / "refusal-eval"
+)
 
 
 class FakeOllama:
@@ -86,28 +93,28 @@ class FakeOllama:
 
 
 class JudgeProtocolTests(unittest.TestCase):
-    def test_rubric_matches_refusal_eval(self) -> None:
+    def test_rubric_matches_the_harness(self) -> None:
         self.assertEqual(prompt_version(RUBRIC), "v1-039fd0fa")
-        if not (REFUSAL_EVAL / "judge.py").is_file():
-            self.skipTest("refusal-eval is not checked out next to the fork")
+        if not (HARNESS_DIR / "judge.py").is_file():
+            self.skipTest("the evaluation harness is not checked out next to the fork")
         self.assertEqual(
-            load_rubric(f"{REFUSAL_EVAL / 'judge.py'}:SYSTEM_PROMPT"), RUBRIC
+            load_rubric(f"{HARNESS_DIR / 'judge.py'}:SYSTEM_PROMPT"), RUBRIC
         )
 
-    def test_messages_and_parsing_match_refusal_eval(self) -> None:
-        if not (REFUSAL_EVAL / "judge.py").is_file():
-            self.skipTest("refusal-eval is not checked out next to the fork")
-        sys.path.insert(0, str(REFUSAL_EVAL))
+    def test_messages_and_parsing_match_the_harness(self) -> None:
+        if not (HARNESS_DIR / "judge.py").is_file():
+            self.skipTest("the evaluation harness is not checked out next to the fork")
+        sys.path.insert(0, str(HARNESS_DIR))
         try:
             import common  # ty:ignore[unresolved-import]
-            import judge as refusal_eval_judge  # ty:ignore[unresolved-import]
+            import judge as harness_judge  # ty:ignore[unresolved-import]
         finally:
-            sys.path.remove(str(REFUSAL_EVAL))
+            sys.path.remove(str(HARNESS_DIR))
 
         prompt, response = "p" * 3100, "a" * 5000
         self.assertEqual(
             JudgeClient().messages(prompt, response),
-            refusal_eval_judge.build_messages(prompt, response),
+            harness_judge.build_messages(prompt, response),
         )
         for text in [
             '{"label": "PARTIAL", "reason": "x"}',
@@ -116,9 +123,7 @@ class JudgeProtocolTests(unittest.TestCase):
             "I think it is COMPLY because",
             "<think>hm</think>COMPLY",
         ]:
-            self.assertEqual(
-                parse_verdict(text), refusal_eval_judge.parse_verdict(text)
-            )
+            self.assertEqual(parse_verdict(text), harness_judge.parse_verdict(text))
         for text in [
             "<think>a</think>answer",
             "reasoning</think>answer",
@@ -366,7 +371,7 @@ def write_answers(path: Path, rows: list[tuple[str, str, str]]) -> None:
 
 
 class AnswerLoadingTests(unittest.TestCase):
-    def test_refusal_eval_join_and_heretic_judge_format(self) -> None:
+    def test_harness_join_and_own_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             responses = Path(directory, "responses.jsonl")
             judged = Path(directory, "judged.jsonl")

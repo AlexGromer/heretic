@@ -6,20 +6,20 @@
 # Abliteration removes the refusal ("no"), but on our models a large share of the answers
 # then becomes PARTIAL (an overview instead of specifics, half the steps): a learned style,
 # not a single direction. Preference tuning changes styles. The pairs come from the
-# abliterated model itself: several sampled answers per prompt, labelled by the refusal-eval
+# abliterated model itself: several sampled answers per prompt, labelled by the the evaluation harness
 # judge; chosen = a COMPLY answer, rejected = a PARTIAL or REFUSAL answer to the same prompt.
 # The only verified precedent is mlabonne's NeuralDaredevil (DPO after abliteration,
 # QLoRA r64 / alpha 32, lr 5e-6, 1 epoch), which healed quality, not refusals; that DPO
 # reduces PARTIAL is a hypothesis to measure (judge, KL, GSM8K).
 #
-# Sampling and judging are refusal-eval's job (one generator and one judge for everything):
+# Sampling and judging are the harness job (one generator and one judge for everything):
 #
-#   refusal-eval: generate_colab.py --sets bad_train --modes sample --samples 4 --out R.jsonl
-#                 judge_colab.py batch --responses R.jsonl --out J.jsonl   (or judge.py batch)
+#   the evaluation harness: its generator: several sampled answers per training prompt -> R.jsonl
+#                 its judge: R.jsonl -> J.jsonl
 #   heretic-dpo-pairs pairs --responses R.jsonl --judged J.jsonl --out pairs.jsonl
 #   heretic-dpo-pairs train --model merged/ --pairs pairs.jsonl --output dpo-adapter/ [--merge merged-dpo/]
 #
-# Use training prompts (refusal-eval train/), not the evaluation hold-out. `train` needs TRL
+# Use training prompts (the evaluation harness train/), not the evaluation hold-out. `train` needs TRL
 # (uv pip install trl), which is not a dependency of Heretic.
 
 import argparse
@@ -91,20 +91,20 @@ def build_pairs(
     return pairs
 
 
-def join_refusal_eval(responses_path: str, judged_path: str) -> list[dict[str, Any]]:
+def join_harness_files(responses_path: str, judged_path: str) -> list[dict[str, Any]]:
     """
-    refusal-eval responses.jsonl rows with the label of judged.jsonl (joined by row key),
+    the harness responses.jsonl rows with the label of judged.jsonl (joined by row key),
     in the shape build_pairs reads (prompt, response, judge_label, finish, system).
     """
-    from .positions import _read_jsonl, _refusal_eval_key
+    from .positions import _read_jsonl, _response_key
 
     labels: dict[str, str] = {}
     for row in _read_jsonl(judged_path):
         if isinstance(row.get("label"), str):
-            labels.setdefault(_refusal_eval_key(row), row["label"])
+            labels.setdefault(_response_key(row), row["label"])
     rows = []
     for row in _read_jsonl(responses_path):
-        label = labels.get(_refusal_eval_key(row))
+        label = labels.get(_response_key(row))
         if label is None:
             continue
         settings = row.get("settings")
@@ -122,7 +122,7 @@ def join_refusal_eval(responses_path: str, judged_path: str) -> list[dict[str, A
 
 
 def command_pairs(args: argparse.Namespace) -> int:
-    rows = join_refusal_eval(args.responses, args.judged)
+    rows = join_harness_files(args.responses, args.judged)
     pairs = build_pairs(
         rows,
         max_pairs_per_prompt=args.max_pairs_per_prompt,
@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="heretic-dpo-pairs",
         description=(
             "DPO pairs (COMPLY vs PARTIAL/REFUSAL) from answers generated and judged by "
-            "refusal-eval, and DPO training."
+            "the evaluation harness, and DPO training."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -213,10 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     pairs.add_argument(
         "--responses",
         required=True,
-        help="refusal-eval responses.jsonl (e.g. generate_colab.py --sets bad_train --samples 4)",
+        help="the harness responses.jsonl (several sampled answers per training prompt)",
     )
     pairs.add_argument(
-        "--judged", required=True, help="refusal-eval judged.jsonl of those responses"
+        "--judged", required=True, help="harness judged.jsonl of those responses"
     )
     pairs.add_argument("--out", required=True)
     pairs.add_argument("--max-pairs-per-prompt", type=int, default=2)

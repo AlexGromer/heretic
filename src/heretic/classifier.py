@@ -3,7 +3,7 @@
 
 # Fast non-answer classifier distilled from the judge (fork addition).
 #
-# The refusal-eval judge (Qwen3-14B) is too slow to score every trial. A small encoder
+# The harness judge (Qwen3-14B) is too slow to score every trial. A small encoder
 # (default ModernBERT-base, as in upstream PR #500) fine-tuned on answers the judge has
 # labelled classifies 100 answers in seconds, so the optimization can minimize the share
 # of REFUSAL + PARTIAL answers instead of keyword refusals (scorer ClassifierRate).
@@ -11,11 +11,11 @@
 #   heretic-train-classifier --responses runs/R/responses.jsonl --judged runs/R/judged.jsonl \
 #       [--responses ... --judged ...] --output classifiers/nonanswer
 #
-# Training data: refusal-eval responses.jsonl joined with judged.jsonl, or files written by
+# Training data: the harness responses.jsonl joined with judged.jsonl, or files written by
 # rows with prompt, response and judge_label / label. Validation holds out whole prompts (an answer
 # of the same prompt from another trial must not be in both sets) and reports Cohen's kappa
 # against the judge, 4-class and for answered vs not answered. Use the classifier only if the
-# binary kappa is high (refusal-eval gates its judge at 0.75).
+# binary kappa is high (the evaluation harness gates its judge at 0.75).
 
 import argparse
 import hashlib
@@ -153,12 +153,12 @@ def main(argv: list[str] | None = None) -> int:
         "--responses",
         action="append",
         required=True,
-        help="Answers (refusal-eval responses.jsonl, or rows with a label); repeatable",
+        help="Answers (the harness responses.jsonl, or rows with a label); repeatable",
     )
     parser.add_argument(
         "--judged",
         action="append",
-        help="refusal-eval judged.jsonl for the --responses at the same position",
+        help="harness judged.jsonl for the --responses at the same position",
     )
     parser.add_argument("--output", required=True, help="Directory for the classifier")
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)

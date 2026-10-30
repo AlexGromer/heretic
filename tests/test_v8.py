@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# Tests of the v8 additions, which use counterfactual prompt pairs (refusal-eval
+# Tests of the v8 additions, which use counterfactual prompt pairs (the evaluation harness
 # train/bad_train and train/good_train are twins at the same index): the whitened
 # direction, the directions from the singular vectors of the pair differences, and ARA's
 # index pairing. CPU only; prompts are neutral placeholders.

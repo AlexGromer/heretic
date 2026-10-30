@@ -339,7 +339,7 @@ class Settings(BaseModel):
         ),
     )
 
-    # Statistics over counterfactual pairs (fork addition). refusal-eval's train/bad_train
+    # Statistics over counterfactual pairs (fork addition). the harness train/bad_train
     # and train/good_train are twins at the same index (same language, same technical
     # terms, same opening words, same final punctuation), so everything but the refusal
     # cancels inside a pair.
@@ -411,7 +411,7 @@ class Settings(BaseModel):
         default=None,
         description=(
             "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
-            "refusal-eval's responses.jsonl with response_direction_judged_file, or rows with judge_label). "
+            "the harness responses.jsonl with response_direction_judged_file, or rows with judge_label). "
             "Adds a direction from the answer tokens: mean over the first response_tokens answer "
             "tokens of answers labelled response_bad_labels minus the same for "
             "response_good_labels (by default PARTIAL minus COMPLY), with its own weight "
@@ -421,7 +421,7 @@ class Settings(BaseModel):
 
     response_direction_judged_file: str | None = Field(
         default=None,
-        description="refusal-eval judged.jsonl whose labels are joined to response_direction_file by row key.",
+        description="harness judged.jsonl whose labels are joined to response_direction_file by row key.",
     )
 
     response_bad_labels: list[str] = Field(
@@ -687,7 +687,7 @@ class Abliteration(Modifier[Parameters]):
                     f"{self.settings.direction_estimator.value} / "
                     f"{self.settings.extra_direction_source.value} compare the prompts at the "
                     f"same index, but there are {len(bad_prompts)} bad and "
-                    f"{len(good_prompts)} good prompts. Use paired sets (refusal-eval "
+                    f"{len(good_prompts)} good prompts. Use paired sets (the evaluation harness "
                     "train/bad_train and train/good_train) or mean_diff / som."
                 )
             print(

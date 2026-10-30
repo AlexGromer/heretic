@@ -133,7 +133,7 @@ class Settings(BaseModel):
         description=(
             'How a bad output finds its target. "knn": the neighbor_count nearest good outputs '
             '(upstream). "index": the good output at the SAME index, i.e. the counterfactual '
-            "twin of that request (refusal-eval train/bad_train and train/good_train are built "
+            "twin of that request (the harness paired training set and train/good_train are built "
             "that way). The twin differs from its bad prompt only in the refusal, so the target "
             "is exact instead of an average of unrelated requests, and neighbor_count is then "
             "unused. Both prompt sets must have the same length and order."
@@ -146,7 +146,7 @@ class Settings(BaseModel):
         default=None,
         description=(
             "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
-            "refusal-eval's responses.jsonl with response_io_judged_file, or rows with judge_label). The "
+            "the harness responses.jsonl with response_io_judged_file, or rows with judge_label). The "
             "module I/O averaged over the first response_tokens answer tokens of answers labelled "
             "response_bad_labels is added to the bad I/O, that of response_good_labels to the "
             "good I/O (by default PARTIAL and COMPLY)."
@@ -155,7 +155,7 @@ class Settings(BaseModel):
 
     response_io_judged_file: str | None = Field(
         default=None,
-        description="refusal-eval judged.jsonl whose labels are joined to response_io_file by row key.",
+        description="harness judged.jsonl whose labels are joined to response_io_file by row key.",
     )
 
     response_bad_labels: list[str] = Field(
@@ -287,7 +287,7 @@ def mean_distances_to_knn(a: Tensor, b: Tensor, k: int) -> Tensor:
 def distances_to_twin(a: Tensor, b: Tensor) -> Tensor:
     """
     The distance of every vector in `a` to the vector at the same index in `b` (fork
-    addition). With counterfactual pairs (refusal-eval train/bad_train and
+    addition). With counterfactual pairs (the harness paired training set and
     train/good_train are twins at the same index) this is the distance to the safe version
     of the very same request, instead of to an average of k unrelated safe requests.
     """
@@ -406,7 +406,7 @@ class ARA(Modifier[Parameters]):
                 raise ValueError(
                     'pairing = "index" compares the prompts at the same index, but there are '
                     f"{len(bad_prompts)} bad and {len(good_prompts)} good prompts. Use paired "
-                    'sets (refusal-eval train/bad_train and train/good_train) or pairing = "knn".'
+                    'sets (the harness paired training set and train/good_train) or pairing = "knn".'
                 )
             languages = sum(
                 detect_lang(bad.user) == detect_lang(good.user)

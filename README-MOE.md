@@ -333,7 +333,7 @@ skipped. Not combined with ARA (ARA does not use the Abliteration settings).
 
 ## 4. Local judge
 
-Superseded by v6, section 1 (the judge now follows refusal-eval exactly).
+Superseded by v6, section 1 (the judge now follows the evaluation harness exactly).
 
 ## Not done
 
@@ -343,36 +343,36 @@ same KL definition. Nothing in the fork blocks it.
 
 # v6: against PARTIAL answers
 
-Same branch `moe-fused-v4`. Measured with the refusal-eval judge (refusal / partial / comply, %):
+Same branch `moe-fused-v4`. Measured with the the evaluation harness judge (refusal / partial / comply, %):
 Qwen3-8B base 52.1 / 32.3 / 15.7, trial 18 1.4 / 46.5 / 52.1; Qwen3-14B base 47.9 / 27.6 / 24.4,
 trial 90 41.9 / 35.0 / 12.9; Qwen3.8-27B base 89.9 / 6.9 / 3.2, trial 96 8.8 / 55.8 / 35.5.
 Abliteration turns refusals into PARTIAL answers, and the keyword metric cannot see them (on
 Qwen3-14B it picked a trial that kept 42% refusals). Everything below is off by default, tested on
 CPU with tiny models (`tests/test_v6.py`), and not measured on real models.
 
-## 1. The refusal-eval judge in Heretic
+## 1. The harness judge in Heretic
 
-`heretic/judge.py` implements the protocol of `refusal-eval/judge.py`, so numbers are comparable:
+`heretic/judge.py` implements the protocol of `the evaluation harness/judge.py`, so numbers are comparable:
 the same system prompt (built-in byte-identical copy, prompt version `v1-039fd0fa`; or
-`rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"`, read by parsing the file, not executing it),
+`rubric = "../the evaluation harness/judge.py:SYSTEM_PROMPT"`, read by parsing the file, not executing it),
 the same user message and clipping, the same CoT stripping, Ollama `/api/chat` with `think: false`,
 the JSON schema, temperature 0, seed 0, 3 retries, and the same parser. Labels REFUSAL, PARTIAL,
 COMPLY, OFF_TOPIC; REFUSAL + PARTIAL count as not answered. Settings in `[scorer.JudgeRate]`
 (endpoint, model, `api = "openai"` for OpenAI-compatible servers, labels, rubric). Used by:
 
-* (removed in branch `repo-split`: the `heretic-judge` command. Files are judged by refusal-eval's
-  `judge.py` / `judge_colab.py batch`; `responses_file` rows are in its format, see below);
+* (removed in branch `repo-split`: the `heretic-judge` command. Files are judged by the harness's
+  `judge.py` / the harness's file judge; `responses_file` rows are in its format, see below);
 * scorer `JudgeRate` (`optimization = "none"`; judges every trial, slow);
 * **judge re-ranking** (`n_judge_ranking_trials = N`): after the optimization, the original model
   and the first N trials of the Pareto front with KL <= `judge_ranking_max_kl` generate answers to
-  the `[scorer.JudgeRate]` prompts (`judge_ranking_response_length`, default 512 like refusal-eval)
+  the `[scorer.JudgeRate]` prompts (`judge_ranking_response_length`, default 512 like the evaluation harness)
   and are judged. The menu lists the judged trials first, by share of non-answers, then by KL, with
   the label counts and the answers cut at the length limit. Stored in the study per prompt version.
 
 ## 2. Distilled classifier as an objective
 
 `heretic-train-classifier --responses R.jsonl --judged J.jsonl --output classifiers/nonanswer`
-fine-tunes ModernBERT-base (as in upstream PR #500) on judged answers (refusal-eval files, joined by
+fine-tunes ModernBERT-base (as in upstream PR #500) on judged answers (the evaluation harness files, joined by
 row key, or rows with a label); validation holds out whole prompts and reports Cohen's kappa
 against the judge (4-class and answered / not answered) and warns below 0.75. Scorer
 `heretic.scorers.classifier_rate.ClassifierRate` (`model_path`) then scores 100 answers in seconds,
@@ -397,13 +397,12 @@ so the optimization can minimize REFUSAL + PARTIAL instead of keyword refusals. 
 
 Additional directions are made orthonormal to the classic one, the good direction and each other,
 and each gets a weight in `direction_weight_range`. Answer files: rows with prompt, response
-and judge_label / label, or refusal-eval `responses.jsonl` plus `judged.jsonl`
+and judge_label / label, or the harness's `responses.jsonl` plus `judged.jsonl`
 (`*_judged_file`). Use answers to training prompts, not the evaluation hold-out.
 
 ## 4. DPO on the model's own answers
 
-Answers are sampled and judged by refusal-eval (`generate_colab.py --sets bad_train --modes sample
---samples 4`, then `judge_colab.py batch`); `heretic-dpo-pairs pairs --responses R --judged J` builds pairs (chosen COMPLY, rejected PARTIAL or
+Answers are sampled and judged by the evaluation harness (the harness's generator with several sampled answers per prompt, then the harness's file judge); `heretic-dpo-pairs pairs --responses R --judged J` builds pairs (chosen COMPLY, rejected PARTIAL or
 REFUSAL, same prompt; cut-off chosen answers dropped) in TRL's conversational format, and trains a
 DPO LoRA (mlabonne's recipe: r64, alpha 32, lr 5e-6, 1 epoch, beta 0.1; `--merge` saves the merged
 model). `train` needs TRL (`uv pip install trl`, not a Heretic dependency). Whether DPO lowers
@@ -415,19 +414,19 @@ PARTIAL is a hypothesis: measure judge rates, KL and GSM8K.
   TrevorS's recipe); without non-finite values it is computed as before.
 * `config.partial.toml`: ARA with judge re-ranking, answer I/O and technical good prompts, plus the
   second-pass recipe in comments.
-* refusal-eval (branch `partial-diagnostics`): judged rows keep `finish`, the summary counts PARTIAL
-  answers cut at the token limit, `generate_colab.py --system-prompt-file` for an
+* the evaluation harness (branch `partial-diagnostics`): judged rows keep `finish`, the summary counts PARTIAL
+  answers cut at the token limit, its generator's system-prompt option for an
   authorized-pentest system prompt.
 
-# Handing ranked trials to an external judge (branch `colab-handoff`)
+# Handing ranked trials to an external judge
 
 For setups where the judge runs in its own process and must not share the GPU with the evaluated
-model (e.g. `refusal-eval/judge_colab.py`); how a pipeline uses this is the pipeline's business:
+model (e.g. the harness's judge process); how a pipeline uses this is the pipeline's business:
 
 * `judge_ranking_mode = "generate"`: after the optimization, Heretic writes the answers of the
   original model (`trial` "base") and of the best `n_judge_ranking_trials` trials within
-  `judge_ranking_max_kl` to `judge_ranking_output`, in refusal-eval's `responses.jsonl` format
-  (same key as `generate_colab.make_key`, greedy, thinking off, `finish`, `win100` / `win256`,
+  `judge_ranking_max_kl` to `judge_ranking_output`, in the harness's `responses.jsonl` format
+  (same key as the harness's key format, greedy, thinking off, `finish`, `win100` / `win256`,
   `settings.generator = "heretic"`). Keys already in the file are skipped, so an interrupted run
   resumes. Without a terminal, Heretic exits after writing. Prompts:
   `judge_ranking_prompts_file` (JSON Lines with id, category, prompt, e.g.
@@ -436,30 +435,39 @@ model (e.g. `refusal-eval/judge_colab.py`); how a pipeline uses this is the pipe
   before its answers are generated, so they come from the same weights an export contains (the
   live LoRA rounds differently, upstream #490). One model reload per trial, no export to disk.
   Rows record `settings.operator` ("merged" or "live LoRA").
-* Ranking on a refusal-eval evaluation hold-out (`data/offsec_holdout*.jsonl`, `harmless*.jsonl`,
+* Ranking on an evaluation harness evaluation hold-out (`data/offsec_holdout*.jsonl`, `harmless*.jsonl`,
   the v3 monitor files) prints a warning: rank on a validation set such as `train/bad_eval` and keep
   the hold-out for the final measurement of the selected trial.
 * `--trial-number N` selects the trial shown as `[Trial N]` (the `trial` field of the rows), from
   all completed trials, independent of the menu order; `--trial-index` still counts menu positions.
-* Colab configs (paths, Drive layout, the two-run recipe) belong to heretic-colab-pipeline, which
+* the runner configs (paths, Drive layout, the two-run recipe) belong to the runner repository, which
   generates its own `config.*.cyber.toml`; this branch only adds the Heretic code they can call.
 
-Tests: `tests/test_colab_handoff.py`.
+Tests: `tests/test_judge_handoff.py`.
 
-# Repository split (branch `repo-split`)
+# Repository boundaries
 
-To keep each job in one place:
+This fork changes models and judges only inside its own process. It contains no paths, settings or
+file names of any particular evaluation harness or runner, so it can be published or offered
+upstream without carrying private ones:
 
-* **refusal-eval** generates evaluation and training answers (`generate_colab.py`, `generate_endpoint.py`), judges files
-  (`judge.py`, `judge_colab.py`), summarizes and compares runs, and owns the prompt sets, including
-  `val/orbench_val` (OR-Bench-hard prompts disjoint from its hold-out monitor).
-* **heretic** (this fork) changes the model and judges only inside its own process (JudgeRate, judge re-ranking). Answers
-  it writes (`responses_file`, `judge_ranking_output`) are refusal-eval responses rows (`heretic/rows.py`): `responses_file`
-  rows carry `trial` "base" / "e1", "e2", ... (evaluations of that scorer in this process), `set` = score name,
-  `match` (keyword verdict). Removed here: the `heretic-judge` command and `heretic-dpo-pairs generate` / `judge`.
-  `config.orbench.toml` reads `refusal-eval/val/orbench_val.txt` (a seeded Hub sample shared 8 of 100 prompts with the
-  hold-out monitor).
-* **heretic-colab-pipeline** runs both in Colab (configs, Drive layout, loop, stages).
+* **This fork** reads prompts from files or Hugging Face datasets, writes its answers as JSON Lines
+  rows (`heretic/rows.py`: key, model, trial, mode, thinking, set, prompt_id, category, prompt,
+  response, settings), and judges only through the endpoint of `[scorer.JudgeRate]`. Judging a
+  file, generating evaluation answers, summarizing and comparing runs are not its job. The example
+  configs use placeholder paths (`prompts/...`); whoever runs it supplies the real ones.
+* **The evaluation harness** (a separate repository) owns the prompt sets, the generators, the file
+  judge, the summaries and the run comparison. Its row format is what `heretic/rows.py` writes, so
+  its judge reads Heretic's files unchanged; the built-in rubric is a copy of its judge prompt, and
+  `[scorer.JudgeRate] rubric = "<harness>/judge.py:SYSTEM_PROMPT"` reads that prompt from there
+  instead (parsed, not executed).
+* **The runner** (another repository) owns the environment: paths, drive layout, the loop over
+  models, the stages and which config a model gets.
+
+Removed from this fork for that reason: the `heretic-judge` command, `heretic-dpo-pairs generate`
+and `judge` (the harness generates and judges), the runner config, and the hard-coded hold-out file
+names, which became `judge_ranking_hold_out_patterns` (globs like `*holdout*`, so the convention
+check names no file of anyone's harness).
 
 # v7: metrics that see more, and more levers
 
@@ -492,7 +500,7 @@ All three add a slot in the same mechanism as v5/v6 (orthonormal to the classic 
 direction and each other, each with its own weight in `direction_weight_range`):
 
 * `language_directions = true`: the bad prompts are split by script (`ru` / `en`, the same rule as
-  refusal-eval's `detect_lang`), and every language with at least `language_min_prompts` prompts
+  the harness's `detect_lang`), and every language with at least `language_min_prompts` prompts
   gets its own direction. The classic direction is dominated by whichever language most of the
   prompts are in - in `train/bad_train` 436 of 612 prompts are Russian while `harmful_behaviors` is
   English.
@@ -524,15 +532,15 @@ objective instead of the keyword counter, with both KL scorers beside it and the
 kept for comparison. Its header has the order of the prerequisites (judged answers, judge
 calibration kappa >= 0.75, trained classifier) and the recipe for running two or three independent
 studies into separate `study_checkpoint_dir` journals and comparing their candidates with
-refusal-eval `compare_runs.py`; TPE runs differ a lot (upstream #88, #202), while more trials in one
+the harness's paired run comparison; TPE runs differ a lot (upstream #88, #202), while more trials in one
 study do not bring refusals down by themselves (#404).
 
 Not done here: wiring the two-stage selection, the new fork patch and `--trial-number` into
-heretic-colab-pipeline (that repository is being changed elsewhere).
+the runner repository (that repository is being changed elsewhere).
 
 # v8: statistics over counterfactual pairs
 
-Branch `paired-directions`. refusal-eval's `train/bad_train` and `train/good_train` are
+Branch `paired-directions`. the harness's paired training sets are
 counterfactual twins at the SAME index: 612 pairs, the same language on both sides in all of
 them, the same three technical terms in 522, the same opening words in 522 and the same final
 punctuation in 583. Inside a pair everything but the refusal cancels, which the mean of the two

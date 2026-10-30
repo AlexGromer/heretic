@@ -138,8 +138,8 @@ class ExampleConfigTests(unittest.TestCase):
         # The instance inherits the shared settings and only replaces the prompts.
         self.assertTrue(cast(Any, orbench).strict)
         prompts = cast(Any, orbench).prompts
-        # refusal-eval's validation file, disjoint from its hold-out monitor.
-        self.assertTrue(prompts.dataset.endswith("val/orbench_val.txt"))
+        # the harness validation file, disjoint from its hold-out monitor.
+        self.assertTrue(prompts.dataset.endswith("orbench_val.txt"))
         self.assertEqual(cast(Any, base).prompts.dataset, "mlabonne/harmful_behaviors")
 
     def test_partial_config(self) -> None:

@@ -225,7 +225,7 @@ LETTER = re.compile(r"[A-Za-zЀ-ӿ]")
 def detect_lang(text: str) -> str:
     """
     "ru" when at least 30% of the letters are Cyrillic, else "en" (fork addition; the same
-    rule as refusal-eval's common.detect_lang, so the two agree on a prompt's language).
+    rule as the harness common.detect_lang, so the two agree on a prompt's language).
     """
     letters = len(LETTER.findall(text or ""))
     return "ru" if letters and len(CYRILLIC.findall(text)) >= 0.3 * letters else "en"

@@ -51,7 +51,7 @@ class Settings(BaseModel):
     endpoint: str = Field(
         default=DEFAULT_ENDPOINT,
         description=(
-            "Endpoint of the judge (default: a local Ollama server; refusal-eval uses its LAN box). "
+            "Endpoint of the judge (default: a local Ollama server; the evaluation harness uses its LAN box). "
             "The prompts and responses are sent there."
         ),
     )
@@ -59,16 +59,16 @@ class Settings(BaseModel):
     api: Literal["ollama", "openai"] = Field(
         default="ollama",
         description=(
-            '"ollama": Ollama /api/chat with thinking off and a JSON schema, as refusal-eval does; '
+            '"ollama": Ollama /api/chat with thinking off and a JSON schema, as the evaluation harness does; '
             '"openai": an OpenAI-compatible /chat/completions endpoint (endpoint ends with /v1).'
         ),
     )
 
-    message_format: Literal["refusal_eval", "template"] = Field(
-        default="refusal_eval",
+    message_format: Literal["harness", "template"] = Field(
+        default="harness",
         description=(
-            '"refusal_eval": the rubric is the system prompt and the user message is built as in '
-            'refusal-eval; "template": the rubric is the user message, with {prompt} and '
+            '"harness": the rubric is the system prompt and the user message is built as in '
+            'the evaluation harness; "template": the rubric is the user message, with {prompt} and '
             "{response} replaced."
         ),
     )
@@ -82,8 +82,8 @@ class Settings(BaseModel):
         default=None,
         description=(
             'The judge prompt: "path/to/file.py:NAME" for a string constant of a Python file '
-            '(parsed, not executed; e.g. "../refusal-eval/judge.py:SYSTEM_PROMPT"), or the path of '
-            "a text file. Unset uses the built-in copy of refusal-eval's prompt v1."
+            '(parsed, not executed; e.g. "../<harness>/judge.py:SYSTEM_PROMPT"), or the path of '
+            "a text file. Unset uses the built-in copy of the harness prompt v1."
         ),
     )
 
@@ -104,7 +104,7 @@ class Settings(BaseModel):
 
     max_tokens: PositiveInt = Field(
         default=160,
-        description="Maximum number of tokens of the judge's reply (refusal-eval: 160).",
+        description="Maximum number of tokens of the judge's reply (the evaluation harness: 160).",
     )
 
     timeout: PositiveFloat = Field(

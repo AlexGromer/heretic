@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# Tests of the Colab handoff: the "generate" judge ranking mode writes refusal-eval
+# Tests of the Colab handoff: the "generate" judge ranking mode writes the evaluation harness
 # responses rows, and --trial-number selects a trial by its number. Pure Python with fakes.
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -21,14 +22,20 @@ from optuna.trial import create_trial
 from heretic.config import Settings
 from heretic.judge_ranking import (
     load_ranking_prompts,
-    refusal_eval_key,
+    response_key,
     select_trial_by_number,
     write_candidate_answers,
 )
 from heretic.scorers.judge_rate import Settings as JudgeSettings
 from heretic.utils import HereticUserError
 
-REFUSAL_EVAL = Path(__file__).resolve().parent.parent.parent / "refusal-eval"
+# Optional cross-check against the evaluation harness, when a checkout of it is next to this
+# repository or HERETIC_HARNESS_DIR points at one. The fork itself does not depend on it; the
+# tests that use it skip when it is absent.
+HARNESS_DIR = Path(
+    os.environ.get("HERETIC_HARNESS_DIR")
+    or Path(__file__).resolve().parent.parent.parent / "refusal-eval"
+)
 
 
 def make_trial(number: int, index: int, kl: float) -> Any:
@@ -163,17 +170,17 @@ class GenerateModeTests(unittest.TestCase):
             )
         self.assertEqual([p.id for p in prompts], ["bad_eval-0000", "bad_eval-0001"])
 
-    def test_key_matches_refusal_eval(self) -> None:
-        generator = REFUSAL_EVAL / "generate_colab.py"
+    def test_key_matches_the_harness(self) -> None:
+        generator = HARNESS_DIR / "generate_colab.py"
         if not generator.is_file():
-            self.skipTest("refusal-eval is not checked out next to the fork")
-        sys.path.insert(0, str(REFUSAL_EVAL))
+            self.skipTest("the evaluation harness is not checked out next to the fork")
+        sys.path.insert(0, str(HARNESS_DIR))
         try:
             import generate_colab  # ty:ignore[unresolved-import]
         finally:
-            sys.path.remove(str(REFUSAL_EVAL))
+            sys.path.remove(str(HARNESS_DIR))
         self.assertEqual(
-            refusal_eval_key("m", "7", "bad_eval", "x-1"),
+            response_key("m", "7", "bad_eval", "x-1"),
             generate_colab.make_key("m", "7", "greedy", False, "bad_eval", "x-1"),
         )
 
@@ -283,9 +290,16 @@ class MergedRankingTests(unittest.TestCase):
     def test_hold_out_warning(self) -> None:
         from heretic.judge_ranking import warn_if_hold_out
 
+        patterns = Settings.model_fields["judge_ranking_hold_out_patterns"].default
         with redirect_stdout(io.StringIO()):
-            self.assertTrue(warn_if_hold_out("refusal-eval/data/offsec_holdout.jsonl"))
-            self.assertFalse(warn_if_hold_out("refusal-eval/train/bad_eval.meta.jsonl"))
+            self.assertTrue(
+                warn_if_hold_out("harness/data/offsec_holdout.jsonl", patterns)
+            )
+            self.assertFalse(
+                warn_if_hold_out("harness/train/bad_eval.meta.jsonl", patterns)
+            )
+            # An empty pattern list turns the convention check off.
+            self.assertFalse(warn_if_hold_out("data/offsec_holdout.jsonl", []))
 
     def test_rows_record_the_operator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -309,8 +323,8 @@ class MergedRankingTests(unittest.TestCase):
 
 
 class DpoJoinTests(unittest.TestCase):
-    def test_pairs_from_refusal_eval_files(self) -> None:
-        from heretic.dpo import build_pairs, join_refusal_eval
+    def test_pairs_from_harness_files(self) -> None:
+        from heretic.dpo import build_pairs, join_harness_files
 
         with tempfile.TemporaryDirectory() as directory:
             responses = Path(directory, "responses.jsonl")
@@ -350,7 +364,7 @@ class DpoJoinTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rows = join_refusal_eval(str(responses), str(judged))
+            rows = join_harness_files(str(responses), str(judged))
 
         self.assertEqual([r["judge_label"] for r in rows], ["COMPLY", "PARTIAL"])
         pairs = build_pairs(rows)

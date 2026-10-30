@@ -339,7 +339,7 @@ class KeywordRate(Scorer):
         evaluation = getattr(self, "_evaluation_count", 0)
         self._evaluation_count = evaluation + 1
 
-        # Rows in refusal-eval's responses format, so refusal-eval's judge can label them
+        # Rows in the harness responses format, so the harness judge can label them
         # (trial "base" is the baseline evaluation, then e1, e2, ... per evaluation of this
         # scorer in this process; set is the score name), plus the keyword verdict.
         model_name = model_label(str(getattr(self.heretic_settings, "model", "")))

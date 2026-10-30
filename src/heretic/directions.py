@@ -174,7 +174,7 @@ def interpolate_extras(extras: Tensor, direction_index: float, main: Tensor) -> 
 def paired_differences(bad_residuals: Tensor, good_residuals: Tensor) -> Tensor:
     """
     The per-pair difference of the residuals, (pair, row, hidden), for prompt sets whose
-    entries are counterfactual twins at the same index (refusal-eval train/bad_train and
+    entries are counterfactual twins at the same index (the harness paired training set and
     train/good_train are built that way: same language, same technical terms, same opening
     words, same final punctuation). Everything but the refusal cancels inside a row, which
     the mean of the two sets cannot do.

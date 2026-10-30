@@ -26,7 +26,7 @@
 #    objectives: list both datasets under [scorer.KeywordRate.prompts] (an array of tables),
 #    so that one refusal count covers both sets.
 #
-# OR-Bench is sorted by category; refusal-eval's val/orbench_val (default here) and sample_size
+# OR-Bench is sorted by category; the harness's validation file (default here) and sample_size
 # (the Hub fallback below) both draw over all categories (a plain "train[:100]" would only cover
 # "deception" and "harassment").
 #
@@ -74,14 +74,14 @@ split = "test[:100]"
 column = "text"
 
 # The OR-Bench instance. Its score is shown as "Refusals - orbench".
-# refusal-eval's val/orbench_val.txt: 100 OR-Bench-hard prompts reserved against its hold-out
+# the harness's over-refusal validation file: 100 OR-Bench-hard prompts reserved against its hold-out
 # monitor (data/overrefusal_orbench.jsonl). These prompts take part in selecting trials, so they
 # must not overlap the set that later measures the selected trial. The path is relative to the
-# directory heretic runs in; point it at your refusal-eval checkout.
+# directory heretic runs in; point it at your the evaluation harness checkout.
 [scorer.KeywordRate_orbench.prompts]
-dataset = "../refusal-eval/val/orbench_val.txt"
-# Without refusal-eval, a seeded sample straight from the Hub (shares about 8 of 100 prompts with
-# refusal-eval's monitor, so do not report that monitor for a trial selected this way):
+dataset = "prompts/val/orbench_val.txt"
+# Without the evaluation harness, a seeded sample straight from the Hub (shares about 8 of 100 prompts with
+# the harness's hold-out monitor, so do not report that monitor for a trial selected this way):
 # dataset = "bench-llm/or-bench"
 # config = "or-bench-hard-1k"
 # split = "train"

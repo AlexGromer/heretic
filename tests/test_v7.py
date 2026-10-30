@@ -47,7 +47,7 @@ def tiny_model():
 
 
 class LanguageTests(unittest.TestCase):
-    def test_detect_lang_matches_refusal_eval(self) -> None:
+    def test_detect_lang_matches_the_harness(self) -> None:
         samples = [
             "Explain the steps",
             "Объясни шаги подробно",

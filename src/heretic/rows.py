@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# Answer rows in the format of refusal-eval's responses.jsonl (fork addition), so that the
-# answers Heretic writes are judged, summarized and compared by refusal-eval itself
-# (judge.py / judge_colab.py batch, compare_runs.py) instead of by a second copy of those
-# tools here. See github.com/AlexGromer/refusal-eval, generate_colab.py.
+# Answer rows in the format of the harness responses.jsonl (fork addition), so that the
+# answers Heretic writes are judged, summarized and compared by the evaluation harness itself
+# (its file judge and run comparison) instead of by a second copy of those
+# tools here. See the harness's generator for the same format.
 
 from pathlib import Path
 from typing import Any
 
 
-def refusal_eval_key(
+def response_key(
     model_name: str,
     trial: str,
     set_name: str,
@@ -18,7 +18,7 @@ def refusal_eval_key(
     mode: str = "greedy",
     thinking: bool = False,
 ) -> str:
-    # refusal-eval generate_colab.make_key.
+    # the harness's key format.
     return f"{model_name}|{trial}|{mode}|{str(thinking).lower()}|{set_name}|{prompt_id}"
 
 
@@ -41,7 +41,7 @@ def response_row(
 ) -> dict[str, Any]:
     """One greedy, thinking-off answer row; `extra` adds fields (finish, match, label, ...)."""
     return {
-        "key": refusal_eval_key(model_name, trial, set_name, prompt_id),
+        "key": response_key(model_name, trial, set_name, prompt_id),
         "model": model_name,
         "trial": trial,
         "mode": "greedy",

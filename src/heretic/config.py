@@ -468,7 +468,7 @@ class Settings(BaseSettings):
         description=(
             '"judge": judge the answers of the ranked trials here, via the judge endpoint. '
             '"generate": only generate them and write them to judge_ranking_output in the format of '
-            "refusal-eval's responses.jsonl, for judging in a separate process (e.g. judge_colab.py, "
+            "the harness responses.jsonl, for judging in a separate process (the harness's judge process, "
             "which must not share the GPU with the evaluated model); then select the trial with "
             "--trial-number."
         ),
@@ -499,7 +499,7 @@ class Settings(BaseSettings):
     judge_ranking_output: str | None = Field(
         default=None,
         description=(
-            'JSON Lines file the "generate" mode appends the answers to (refusal-eval responses '
+            'JSON Lines file the "generate" mode appends the answers to (the evaluation harness responses '
             "format; keys already in the file are skipped, so an interrupted run resumes)."
         ),
         exclude=True,
@@ -509,16 +509,26 @@ class Settings(BaseSettings):
         default=None,
         description=(
             "JSON Lines file of the ranking prompts with id, category and prompt fields, such as "
-            "refusal-eval's train/bad_eval.meta.jsonl. Unset uses the [scorer.JudgeRate] prompts "
+            "the harness train/bad_eval.meta.jsonl. Unset uses the [scorer.JudgeRate] prompts "
             "(ids are then <set>-<line>). Do not rank on the evaluation hold-out, or the hold-out "
             "no longer measures the selected model independently."
         ),
         exclude=True,
     )
 
+    judge_ranking_hold_out_patterns: list[str] = Field(
+        default=["*holdout*", "*hold_out*"],
+        description=(
+            "Shell globs (matched case insensitively against the file name of "
+            "judge_ranking_prompts_file) that mark a prompt file as an evaluation hold-out. "
+            "Ranking trials on such a file makes its numbers for the selected trial optimistic, "
+            "so Heretic prints a warning. Empty disables the check."
+        ),
+    )
+
     judge_ranking_set: str = Field(
         default="bad_eval",
-        description='Set name written into the generated rows (refusal-eval "set").',
+        description='Set name written into the generated rows (the evaluation harness "set").',
     )
 
     judge_ranking_model_name: str | None = Field(
@@ -534,7 +544,7 @@ class Settings(BaseSettings):
     judge_ranking_response_length: PositiveInt = Field(
         default=512,
         description=(
-            "Maximum number of tokens of each answer that is judged (refusal-eval uses 512). "
+            "Maximum number of tokens of each answer that is judged (the evaluation harness uses 512). "
             "Longer than max_response_length, because PARTIAL answers often turn evasive later."
         ),
     )

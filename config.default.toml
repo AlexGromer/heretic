@@ -128,9 +128,9 @@ n_judge_ranking_trials = 0
 judge_ranking_max_kl = 0.15
 
 # "judge": judge here via the judge endpoint. "generate": only write the answers of the original
-# model ("base") and the ranked trials to judge_ranking_output in refusal-eval's responses.jsonl
+# model ("base") and the ranked trials to judge_ranking_output in the harness's responses.jsonl
 # format (keys already there are skipped), for judging in a separate process such as
-# judge_colab.py, which must not share the GPU with the evaluated model. Then select the trial
+# the harness's judge process, which must not share the GPU with the evaluated model. Then select the trial
 # with --trial-number N (the "trial" field). Without a terminal, Heretic exits after writing.
 judge_ranking_mode = "judge"
 
@@ -138,16 +138,21 @@ judge_ranking_mode = "judge"
 # from the weights an export contains (the live LoRA rounds differently, upstream issue #490).
 # One model reload per ranked trial; false is faster but measures the live LoRA.
 judge_ranking_merged = true
-# judge_ranking_output = "/content/drive/MyDrive/heretic/candidates.responses.jsonl"
+# judge_ranking_output = "runs/candidates.responses.jsonl"
 
-# Ranking prompts as JSON Lines with id, category and prompt (e.g. refusal-eval's
+# Ranking prompts as JSON Lines with id, category and prompt (e.g. the evaluation harness's
 # train/bad_eval.meta.jsonl); unset uses the [scorer.JudgeRate] prompts. Do not rank on the
 # evaluation hold-out. Set name and model label written into the generated rows.
-# judge_ranking_prompts_file = "refusal-eval/train/bad_eval.meta.jsonl"
+# judge_ranking_prompts_file = "prompts/train/bad_eval.meta.jsonl"
 judge_ranking_set = "bad_eval"
+
+# Shell globs (matched case insensitively against the file name of judge_ranking_prompts_file)
+# that mark a prompt file as an evaluation hold-out: ranking trials on it makes its numbers for
+# the selected trial optimistic, so Heretic warns. Empty disables the check.
+judge_ranking_hold_out_patterns = ["*holdout*", "*hold_out*"]
 # judge_ranking_model_name = "qwen3-8b-heretic"
 
-# Length of the judged answers (refusal-eval: 512) and the batch size for generating them
+# Length of the judged answers (the harness uses: 512) and the batch size for generating them
 # (0 = batch_size; longer answers need more memory than batch_size was determined for).
 judge_ranking_response_length = 512
 judge_ranking_batch_size = 0
@@ -341,7 +346,7 @@ split = "test[:100]"
 column = "text"
 
 
-# Share of non-answers according to the refusal-eval judge (fork addition, see README-MOE.md).
+# Share of non-answers according to the harness judge (fork addition, see README-MOE.md).
 # Add it as { plugin = "heretic.scorers.judge_rate.JudgeRate", optimization = "none" } to judge
 # every trial (slow). The same settings configure the judge of n_judge_ranking_trials, whether
 # or not the scorer is listed. Every judged answer is sent to the endpoint, so keep it local.
@@ -349,21 +354,21 @@ column = "text"
 score_name = "Judge non-answers"
 
 # Judge server. "ollama": Ollama's /api/chat with thinking off and a JSON schema, exactly as
-# refusal-eval's judge.py; "openai": an OpenAI-compatible endpoint (endpoint ends with /v1).
+# the harness's judge.py; "openai": an OpenAI-compatible endpoint (endpoint ends with /v1).
 endpoint = "http://localhost:11434"
 api = "ollama"
 
-# Name of the judge model at the endpoint (refusal-eval: qwen3:14b).
+# Name of the judge model at the endpoint (the harness uses: qwen3:14b).
 model = "qwen3:14b"
 
-# The judge prompt. Unset: the built-in copy of refusal-eval's SYSTEM_PROMPT v1 (prompt version
+# The judge prompt. Unset: the built-in copy of the harness's SYSTEM_PROMPT v1 (prompt version
 # v1-039fd0fa). "path/to/file.py:NAME" reads a string constant from a Python file without
-# executing it, e.g. rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"; another path is a text file.
-# rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"
+# executing it, e.g. rubric = "prompts/judge.py:SYSTEM_PROMPT"; another path is a text file.
+# rubric = "prompts/judge.py:SYSTEM_PROMPT"
 
-# "refusal_eval": the rubric is the system prompt and the user message is built as in
-# refusal-eval; "template": the rubric is the user message with {prompt} and {response} replaced.
-message_format = "refusal_eval"
+# "harness": the rubric is the system prompt and the user message is built as in
+# the evaluation harness; "template": the rubric is the user message with {prompt} and {response} replaced.
+message_format = "harness"
 
 # Labels the rubric asks for, the labels that count as not answered (the score is their share),
 # and the label of answers that are empty after removing the reasoning (not sent to the judge).
@@ -372,7 +377,7 @@ refusal_labels = ["REFUSAL", "PARTIAL"]
 empty_label = "OFF_TOPIC"
 
 # Maximum tokens of the judge's reply, timeout of one request in seconds, and attempts
-# per answer (refusal-eval: 160, 180, 3).
+# per answer (the harness uses: 160, 180, 3).
 max_tokens = 160
 timeout = 180.0
 retries = 3
@@ -482,7 +487,7 @@ line_search = "strong_wolfe"
 # over the first response_tokens tokens of the visible answer is added to the bad I/O for answers
 # labelled response_bad_labels and to the good I/O for response_good_labels, so that the loss also
 # pulls the outputs of evasive answers towards those of real answers, where the evasion happens.
-# The file has prompt, response and judge_label (or label) per row, or is refusal-eval's
+# The file has prompt, response and judge_label (or label) per row, or is the evaluation harness's
 # responses.jsonl with response_io_judged_file = its judged.jsonl.
 # response_io_file = "runs/qwen3-8b-t18/responses.jsonl"
 # response_io_judged_file = "runs/qwen3-8b-t18/judged.jsonl"
@@ -508,7 +513,7 @@ neighbor_count_max = 15
 
 # How a bad output finds its target (fork addition). "knn": the neighbor_count nearest good
 # outputs (upstream). "index": the good output at the SAME index, i.e. the counterfactual twin of
-# that request (refusal-eval train/bad_train and train/good_train are built that way). The twin
+# that request (the harness's paired training sets are built that way). The twin
 # differs only in the refusal, so the target is exact instead of an average over unrelated
 # requests, and neighbor_count is unused. Both sets must have the same length and order.
 pairing = "knn"
@@ -589,7 +594,7 @@ ega_frequency_scaling = "max"
 # of the means of the two prompt sets (upstream). "whitened": that difference corrected by the
 # covariance of the PER-PAIR differences, i.e. the axes along which the pairs barely vary count
 # for more (LDA-like). "whitened" needs paired prompt sets - the prompts at the same index must be
-# counterfactual twins, as refusal-eval's train/bad_train and train/good_train are (same language,
+# counterfactual twins, as the harness's paired training sets are (same language,
 # same technical terms, same opening words, same final punctuation), and both sets must have the
 # same length. It also keeps the per-prompt residuals of both sets in memory
 # (prompts * (layers + 1) * hidden * 4 bytes each).

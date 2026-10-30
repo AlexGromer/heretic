@@ -17,7 +17,7 @@
 #   direction is taken at the last instruction token ("instruction positions").
 #
 # Answers come from a JSON Lines file with prompt, response and label, as written by
-# refusal-eval (responses.jsonl joined with judged.jsonl), or rows that carry a judge_label / label.
+# the evaluation harness (responses.jsonl joined with judged.jsonl), or rows that carry a judge_label / label.
 
 import json
 import random
@@ -50,8 +50,8 @@ class LabelledAnswer:
     reason: str = ""
 
 
-def _refusal_eval_key(row: dict[str, Any]) -> str:
-    # refusal-eval judge.row_key.
+def _response_key(row: dict[str, Any]) -> str:
+    # harness judge.row_key.
     if row.get("key"):
         return str(row["key"])
     return "|".join(
@@ -82,7 +82,7 @@ def load_labelled_answers(
 ) -> list[LabelledAnswer]:
     """
     Answers with labels from `responses_path`. Without `judged_path`, every row needs its
-    label in `judge_label` or `label`. With `judged_path` (refusal-eval's
+    label in `judge_label` or `label`. With `judged_path` (the harness
     judged.jsonl, which has no prompts or responses), labels are joined by the row key.
     """
     rows = _read_jsonl(responses_path)
@@ -92,7 +92,7 @@ def load_labelled_answers(
         for row in _read_jsonl(judged_path):
             label = row.get("label")
             if isinstance(label, str):
-                key = _refusal_eval_key(row)
+                key = _response_key(row)
                 labels.setdefault(key, label)
                 if isinstance(row.get("reason"), str):
                     reasons.setdefault(key, row["reason"])
@@ -100,7 +100,7 @@ def load_labelled_answers(
     answers = []
     for row in rows:
         if judged_path is not None:
-            key = _refusal_eval_key(row)
+            key = _response_key(row)
             label = labels.get(key)
             if key in reasons:
                 row = {**row, "judge_reason": reasons[key]}

@@ -1,6 +1,6 @@
 # Heretic configuration against PARTIAL answers (fork addition, see README-MOE.md, v6).
 #
-# Measured with the refusal-eval judge, abliteration turned refusals into PARTIAL answers
+# Measured with the harness judge, abliteration turned refusals into PARTIAL answers
 # (overview instead of specifics, half the steps, educational pivot): Qwen3-8B t18 46.5%
 # PARTIAL, Qwen3.8-27B t96 55.8%, and on Qwen3-14B the keyword metric picked a trial with
 # 41.9% refusals. This config combines the levers that need no extra training:
@@ -12,10 +12,10 @@
 #    answers on the good side (response_io_file), so the loss acts where the evasion happens.
 #
 # Steps:
-# - Run refusal-eval on a previous trial (generate + judge) to get responses.jsonl and
+# - Run the harness on a previous trial (generate + judge) to get responses.jsonl and
 #   judged.jsonl; use runs of the same model. Train prompts only: answers to prompts of the
 #   evaluation hold-out must not be used, or the hold-out stops measuring generalization.
-#   (refusal-eval's offsec hold-out is evaluation data; generate training answers on other
+#   (the harness's evaluation hold-out is evaluation data; generate training answers on other
 #   prompts, e.g. with heretic-dpo-pairs generate + judge.)
 # - Put the paths below, start the judge (Ollama with qwen3:14b), run heretic.
 # - Optional, once enough answers are judged: heretic-train-classifier, then make ClassifierRate
@@ -72,11 +72,11 @@ split = "test[:100]"
 column = "text"
 
 # The judge (also used by n_judge_ranking_trials). Prompts: your own evaluation set, e.g. a
-# text file with refusal-eval's offsec hold-out prompts, one per line.
+# text file with the harness's evaluation hold-out prompts, one per line.
 [scorer.JudgeRate]
 endpoint = "http://localhost:11434"
 model = "qwen3:14b"
-# rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"
+# rubric = "prompts/judge.py:SYSTEM_PROMPT"
 
 [scorer.JudgeRate.prompts]
 dataset = "mlabonne/harmful_behaviors"

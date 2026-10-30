@@ -3,10 +3,9 @@
 #
 # Prerequisites, in order:
 #
-# 1. Answers on the training prompts, judged: refusal-eval
-#    `generate_colab.py --sets bad_train --modes sample --samples 4` and
-#    `judge_colab.py batch` (or `judge.py batch`).
-# 2. The judge calibrated against your own labels: refusal-eval `calibration/make_sheet.py`,
+# 1. Answers on the training prompts, judged: the harness's generator
+#    (several sampled answers per training prompt) and its judge.
+# 2. The judge calibrated against your own labels: the harness's calibration sheet builder,
 #    fill `human_label`, `calibration/kappa.py`. Below a kappa of about 0.75 the judge's
 #    numbers are not solid enough to optimize against, and a classifier distilled from it
 #    cannot be better than the judge.
@@ -29,7 +28,7 @@
 # Adding trials to one study is not the same thing: upstream #404 says more trials do not
 # bring the refusals down by themselves, while a second study explores from a new start.
 # Afterwards, judge the candidates of every run (n_judge_ranking_trials below) and compare
-# them with refusal-eval `compare_runs.py`, which tells a real difference from noise.
+# them with the harness's paired run comparison, which tells a real difference from noise.
 #
 # Usage: copy to config.toml in the directory you run heretic from, set `model` and the paths.
 
@@ -69,21 +68,21 @@ responses_file = "responses.jsonl"
 n_judge_ranking_trials = 6
 judge_ranking_max_kl = 0.15
 judge_ranking_response_length = 512
-judge_ranking_prompts_file = "../refusal-eval/train/bad_eval.meta.jsonl"
+judge_ranking_prompts_file = "prompts/train/bad_eval.meta.jsonl"
 judge_ranking_benchmarks = ["gsm8k:exact_match,strict-match"]
 
 [scorer.ClassifierRate]
 model_path = "classifiers/nonanswer"
 
 [scorer.ClassifierRate.prompts]
-dataset = "../refusal-eval/train/bad_eval.txt"
+dataset = "prompts/train/bad_eval.txt"
 
 [scorer.KeywordRate]
 strict = true
 strict_window_tokens = 256
 
 [scorer.KeywordRate.prompts]
-dataset = "../refusal-eval/train/bad_eval.txt"
+dataset = "prompts/train/bad_eval.txt"
 
 [scorer.KLDivergence.prompts]
 dataset = "mlabonne/harmless_alpaca"
@@ -101,7 +100,7 @@ endpoint = "http://localhost:11434"
 model = "qwen3:14b"
 
 [scorer.JudgeRate.prompts]
-dataset = "../refusal-eval/train/bad_eval.txt"
+dataset = "prompts/train/bad_eval.txt"
 
 [modifier.ARA]
 # Judged answers of a previous model on the training prompts (see the header).
@@ -109,7 +108,7 @@ dataset = "../refusal-eval/train/bad_eval.txt"
 # response_io_judged_file = "runs/qwen3-8b-t18-train/judged.jsonl"
 
 [modifier.ARA.good_prompts]
-dataset = "../refusal-eval/train/good_train.txt"
+dataset = "prompts/train/good_train.txt"
 
 [modifier.ARA.bad_prompts]
-dataset = "../refusal-eval/train/bad_train.txt"
+dataset = "prompts/train/bad_train.txt"

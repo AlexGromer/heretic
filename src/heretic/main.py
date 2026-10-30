@@ -848,7 +848,7 @@ def run():
             )
 
             # Fork addition: judge the best trials and the original model with the
-            # refusal-eval judge, and list the judged trials first. In the "generate"
+            # harness judge, and list the judged trials first. In the "generate"
             # mode, the answers are only written for judging in another process.
             judge_scores: dict[str, dict[str, Any]] = {}
             if settings.judge_ranking_mode == "generate":
@@ -857,7 +857,7 @@ def run():
                 )
                 if written is not None:
                     print(
-                        f"* Judge [bold]{written}[/] separately (e.g. judge_colab.py batch), "
+                        f"* Judge [bold]{written}[/] separately (e.g. the harness's file judge), "
                         "then select a trial with --trial-number N "
                         '(the trial numbers are the "trial" field; "base" is the original model).'
                     )

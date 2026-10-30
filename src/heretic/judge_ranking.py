@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# Fork addition: re-rank the best trials by the refusal-eval judge after the optimization.
+# Fork addition: re-rank the best trials by the harness judge after the optimization.
 #
 # The optimization picks trials by keyword refusals, which cannot see non-answers without
 # refusal words (PARTIAL: overview instead of specifics, half the steps, educational pivot).
@@ -12,8 +12,10 @@
 
 import json
 from collections import Counter
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,7 @@ from .config import Settings
 from .judge import JudgeError, JudgeResult
 from .model import Model
 from .modifier import Context, Modifier
-from .rows import model_label, refusal_eval_key, response_row
+from .rows import model_label, response_key, response_row
 from .scorers.judge_rate import JudgeRate, judge_responses
 from .scorers.judge_rate import Settings as JudgeSettings
 from .system import empty_cache
@@ -153,7 +155,7 @@ def append_responses(
     result: JudgeResult,
     prompt_version: str,
 ) -> None:
-    """The judged answers as refusal-eval rows with the label (as in a judged.jsonl)."""
+    """The judged answers as the evaluation harness rows with the label (as in a judged.jsonl)."""
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "a", encoding="utf-8") as file:
@@ -176,27 +178,22 @@ def append_responses(
             file.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
-# File names of refusal-eval's evaluation sets (data/), which must not be used to select a
-# trial: a hold-out that took part in the selection no longer measures the selected model
-# independently. Ranking belongs on a validation set such as train/bad_eval.
-HOLD_OUT_FILES = (
-    "offsec_holdout.jsonl",
-    "offsec_holdout_x.jsonl",
-    "harmless.jsonl",
-    "harmless_sec.jsonl",
-    "overrefusal_xstest.jsonl",
-    "overrefusal_orbench.jsonl",
-    "sec_frr.jsonl",
-)
-
-
-def warn_if_hold_out(path: str) -> bool:
-    if Path(path).name not in HOLD_OUT_FILES:
+def warn_if_hold_out(path: str, patterns: Sequence[str]) -> bool:
+    """
+    Warns when the ranking prompts look like an evaluation hold-out: a set that took part in
+    selecting a trial no longer measures that trial independently. The patterns are shell
+    globs matched against the file name, case insensitively (setting
+    judge_ranking_hold_out_patterns), so this is a convention check and names no file of any
+    particular evaluation harness.
+    """
+    name = Path(path).name.lower()
+    if not any(fnmatch(name, pattern.lower()) for pattern in patterns):
         return False
     print(
-        f"[yellow]WARNING: {path} is a refusal-eval evaluation hold-out. Selecting trials on it "
-        "makes the hold-out numbers of the selected trial optimistic; rank on a validation set "
-        "such as train/bad_eval.meta.jsonl and keep the hold-out for the final measurement.[/]"
+        f"[yellow]WARNING: {path} looks like an evaluation hold-out (it matches "
+        "judge_ranking_hold_out_patterns). Selecting trials on it makes its numbers for the "
+        "selected trial optimistic; rank on a separate validation set and keep the hold-out "
+        "for the final measurement.[/]"
     )
     return True
 
@@ -216,7 +213,10 @@ def load_ranking_prompts(
     prompt), or from the [scorer.JudgeRate] prompts with ids <set>-<line>.
     """
     if settings.judge_ranking_prompts_file is not None:
-        warn_if_hold_out(settings.judge_ranking_prompts_file)
+        warn_if_hold_out(
+            settings.judge_ranking_prompts_file,
+            settings.judge_ranking_hold_out_patterns,
+        )
         prompts = []
         with open(settings.judge_ranking_prompts_file, encoding="utf-8") as file:
             for index, line in enumerate(line for line in file if line.strip()):
@@ -308,7 +308,7 @@ def write_candidate_answers(
     """
     The "generate" mode: appends the answers of the original model ("base") and of the
     candidate trials (labelled with their trial numbers) to judge_ranking_output, in the
-    format of refusal-eval's responses.jsonl, skipping keys already there. Returns the path.
+    format of the harness responses.jsonl, skipping keys already there. Returns the path.
     """
     if settings.n_judge_ranking_trials == 0:
         return None
@@ -340,7 +340,7 @@ def write_candidate_answers(
         (label, trial)
         for label, trial in jobs
         if any(
-            refusal_eval_key(model_name, label, settings.judge_ranking_set, p.id)
+            response_key(model_name, label, settings.judge_ranking_set, p.id)
             not in done
             for p in prompts
         )
@@ -375,7 +375,7 @@ def write_candidate_answers(
 
         rows = []
         for ranking_prompt, response in zip(prompts, responses):
-            key = refusal_eval_key(
+            key = response_key(
                 model_name, label, settings.judge_ranking_set, ranking_prompt.id
             )
             if key in done:
