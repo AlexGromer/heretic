@@ -26,6 +26,7 @@ from .model import Model
 from .modifier import Context, Modifier
 from .scorers.judge_rate import JudgeRate, judge_responses
 from .scorers.judge_rate import Settings as JudgeSettings
+from .system import empty_cache
 from .utils import Prompt, format_exception, load_prompts, print
 
 # Study user attribute with the judge results, by trial number (as a string) and "baseline".
@@ -163,6 +164,31 @@ def append_responses(
             file.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+# File names of refusal-eval's evaluation sets (data/), which must not be used to select a
+# trial: a hold-out that took part in the selection no longer measures the selected model
+# independently. Ranking belongs on a validation set such as train/bad_eval.
+HOLD_OUT_FILES = (
+    "offsec_holdout.jsonl",
+    "offsec_holdout_x.jsonl",
+    "harmless.jsonl",
+    "harmless_sec.jsonl",
+    "overrefusal_xstest.jsonl",
+    "overrefusal_orbench.jsonl",
+    "sec_frr.jsonl",
+)
+
+
+def warn_if_hold_out(path: str) -> bool:
+    if Path(path).name not in HOLD_OUT_FILES:
+        return False
+    print(
+        f"[yellow]WARNING: {path} is a refusal-eval evaluation hold-out. Selecting trials on it "
+        "makes the hold-out numbers of the selected trial optimistic; rank on a validation set "
+        "such as train/bad_eval.meta.jsonl and keep the hold-out for the final measurement.[/]"
+    )
+    return True
+
+
 @dataclass
 class RankingPrompt:
     id: str
@@ -178,6 +204,7 @@ def load_ranking_prompts(
     prompt), or from the [scorer.JudgeRate] prompts with ids <set>-<line>.
     """
     if settings.judge_ranking_prompts_file is not None:
+        warn_if_hold_out(settings.judge_ranking_prompts_file)
         prompts = []
         with open(settings.judge_ranking_prompts_file, encoding="utf-8") as file:
             for index, line in enumerate(line for line in file if line.strip()):
@@ -223,7 +250,22 @@ def generate_answers(
         settings.judge_ranking_response_length,
         settings.judge_ranking_batch_size,
     ):
-        return model.get_responses_batched(prompts, skip_special_tokens=True)
+        if trial is None or not settings.judge_ranking_merged:
+            return model.get_responses_batched(prompts, skip_special_tokens=True)
+
+        # The live LoRA rounds differently than the merged weights that an export
+        # contains (#490), so merge in memory and generate with the merged model.
+        # Without quantization, merging consumes the live model (needs_reload is set),
+        # and the next reset reloads it.
+        merged = model.get_merged_model()
+        live = model.model
+        model.model = merged
+        try:
+            return model.get_responses_batched(prompts, skip_special_tokens=True)
+        finally:
+            model.model = live
+            del merged
+            empty_cache()
 
 
 def refusal_eval_key(model_name: str, trial: str, set_name: str, prompt_id: str) -> str:
@@ -292,6 +334,7 @@ def write_candidate_answers(
         "response_prefix": settings.response_prefix,
         "temperature": 0.0,
         "generator": "heretic",
+        "operator": "merged" if settings.judge_ranking_merged else "live LoRA",
     }
 
     for label, trial in jobs:

@@ -133,6 +133,11 @@ judge_ranking_max_kl = 0.15
 # judge_colab.py, which must not share the GPU with the evaluated model. Then select the trial
 # with --trial-number N (the "trial" field). Without a terminal, Heretic exits after writing.
 judge_ranking_mode = "judge"
+
+# Merge each ranked trial into the weights in memory before generating its answers, so they come
+# from the weights an export contains (the live LoRA rounds differently, upstream issue #490).
+# One model reload per ranked trial; false is faster but measures the live LoRA.
+judge_ranking_merged = true
 # judge_ranking_output = "/content/drive/MyDrive/heretic/candidates.responses.jsonl"
 
 # Ranking prompts as JSON Lines with id, category and prompt (e.g. refusal-eval's

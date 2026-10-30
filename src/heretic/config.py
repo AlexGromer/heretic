@@ -474,6 +474,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    judge_ranking_merged: bool = Field(
+        default=True,
+        description=(
+            "Merge each ranked trial into the weights in memory before generating its answers, so "
+            "that they come from the same weights an export contains (the live LoRA rounds "
+            "differently, upstream issue #490). Costs one model reload per ranked trial; false "
+            "generates with the live LoRA (faster, slightly different from the exported model)."
+        ),
+    )
+
     judge_ranking_output: str | None = Field(
         default=None,
         description=(

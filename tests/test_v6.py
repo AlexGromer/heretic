@@ -257,6 +257,7 @@ class JudgeRankingTests(unittest.TestCase):
             prompts_file.write_text("a\nb\n", encoding="utf-8")
             settings = Settings.model_construct(
                 n_judge_ranking_trials=2,
+                judge_ranking_merged=False,
                 judge_ranking_max_kl=0.15,
                 judge_ranking_response_length=4,
                 judge_ranking_batch_size=0,

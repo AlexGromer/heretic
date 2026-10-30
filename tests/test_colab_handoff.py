@@ -79,6 +79,8 @@ def handoff_settings(directory: str, **overrides: Any) -> Settings:
         "judge_ranking_response_length": 3,
         "judge_ranking_batch_size": 0,
         "judge_ranking_mode": "generate",
+        # The fakes have no merge; the merged path has its own tests.
+        "judge_ranking_merged": False,
         "judge_ranking_output": str(Path(directory, "out", "candidates.jsonl")),
         "judge_ranking_prompts_file": str(prompts),
         "judge_ranking_set": "bad_eval",
@@ -174,6 +176,136 @@ class GenerateModeTests(unittest.TestCase):
             refusal_eval_key("m", "7", "bad_eval", "x-1"),
             generate_colab.make_key("m", "7", "greedy", False, "bad_eval", "x-1"),
         )
+
+
+class MergedRankingTests(unittest.TestCase):
+    def run_generate(self, merged: bool) -> tuple[list[str], Any]:
+        from heretic.judge_ranking import generate_answers
+        from heretic.utils import Prompt
+
+        seen: list[str] = []
+        live, merged_model = object(), object()
+
+        class FakeModel:
+            model: Any = live
+
+            def get_merged_model(self) -> Any:
+                return merged_model
+
+            def get_responses_batched(
+                self, prompts: Any, skip_special_tokens: bool
+            ) -> list[str]:
+                seen.append("merged" if self.model is merged_model else "live")
+                return ["a" for _ in prompts]
+
+        model = FakeModel()
+        settings = Settings.model_construct(
+            judge_ranking_merged=merged,
+            judge_ranking_response_length=4,
+            judge_ranking_batch_size=0,
+            max_response_length=100,
+            batch_size=8,
+        )
+        trial = make_trial(1, 7, 0.1)
+        prompts = [Prompt(system="s", user="u")]
+        generate_answers(
+            settings,
+            cast(Any, model),
+            cast(Any, FakeModifier()),
+            cast(Any, None),
+            None,
+            prompts,
+        )
+        generate_answers(
+            settings,
+            cast(Any, model),
+            cast(Any, FakeModifier()),
+            cast(Any, None),
+            trial,
+            prompts,
+        )
+        return seen, model.model is live
+
+    def test_merged_by_default_and_live_on_request(self) -> None:
+        self.assertTrue(Settings.model_fields["judge_ranking_merged"].default)
+        # The original model has no adapter to merge.
+        self.assertEqual(self.run_generate(True), (["live", "merged"], True))
+        self.assertEqual(self.run_generate(False), (["live", "live"], True))
+
+    def test_merged_generation_on_the_tiny_model(self) -> None:
+        from peft import PeftModel
+        from test_fused_experts import get_model
+
+        from heretic.judge_ranking import generate_answers
+        from heretic.modifier import Context
+        from heretic.utils import Prompt
+
+        model = get_model()
+        if not isinstance(model.model, PeftModel):
+            model.apply_lora(2)
+
+        class LoraModifier(FakeModifier):
+            def reset_model(self, ctx: Any) -> None:
+                if not model.reset_model():
+                    model.apply_lora(2)
+
+        settings = model.settings
+        previous = (
+            settings.judge_ranking_merged,
+            settings.judge_ranking_response_length,
+        )
+        settings.judge_ranking_merged = True
+        settings.judge_ranking_response_length = 3
+        try:
+            with redirect_stdout(io.StringIO()):
+                answers = generate_answers(
+                    settings,
+                    model,
+                    cast(Any, LoraModifier()),
+                    Context(settings=settings, model=model),
+                    make_trial(1, 1, 0.1),
+                    [Prompt(system="s", user="hello")],
+                )
+                self.assertTrue(model.needs_reload)
+                # The next reset reloads the model, with fresh adapters.
+                LoraModifier().reset_model(None)
+            self.assertIsInstance(model.model, PeftModel)
+            self.assertFalse(model.needs_reload)
+        finally:
+            settings.judge_ranking_merged, settings.judge_ranking_response_length = (
+                previous
+            )
+            # Other test modules share the cached model and expect it without adapters.
+            model.needs_reload = True
+            model.reset_model()
+        self.assertEqual(len(answers), 1)
+
+    def test_hold_out_warning(self) -> None:
+        from heretic.judge_ranking import warn_if_hold_out
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(warn_if_hold_out("refusal-eval/data/offsec_holdout.jsonl"))
+            self.assertFalse(warn_if_hold_out("refusal-eval/train/bad_eval.meta.jsonl"))
+
+    def test_rows_record_the_operator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = handoff_settings(directory, judge_ranking_merged=False)
+
+            class FakeModel:
+                tokenizer = FakeTokenizer()
+
+                def get_responses_batched(
+                    self, prompts: Any, skip_special_tokens: bool
+                ) -> list[str]:
+                    return ["x" for _ in prompts]
+
+            with redirect_stdout(io.StringIO()):
+                path = write_candidate_answers(
+                    [], settings, cast(Any, FakeModel()), cast(Any, FakeModifier())
+                )
+            assert path is not None
+            row = json.loads(Path(path).read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["settings"]["operator"], "live LoRA")
 
 
 class DpoJoinTests(unittest.TestCase):

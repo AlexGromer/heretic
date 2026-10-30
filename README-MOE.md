@@ -431,6 +431,15 @@ must not share the GPU with the evaluated model:
   resumes. Without a terminal, Heretic exits after writing. Prompts:
   `judge_ranking_prompts_file` (JSON Lines with id, category, prompt, e.g.
   `train/bad_eval.meta.jsonl`), set name `judge_ranking_set`, model label `judge_ranking_model_name`.
+* `judge_ranking_merged = true` (default): each ranked trial is merged into the weights in memory
+  before its answers are generated, so they come from the same weights an export contains (the
+  live LoRA rounds differently, upstream #490). One model reload per trial, no export to disk.
+  Rows record `settings.operator` ("merged" or "live LoRA").
+* Ranking on a refusal-eval evaluation hold-out (`data/offsec_holdout*.jsonl`, `harmless*.jsonl`,
+  the v3 monitor files) prints a warning: rank on a validation set such as `train/bad_eval` and keep
+  the hold-out for the final measurement of the selected trial.
+* Intended use in the pipeline: a cheap first stage (rank ~8 trials on `bad_eval`, judge, keep 2-3),
+  then the existing exact stage (export those and measure them on the hold-out).
 * `--trial-number N` selects the trial shown as `[Trial N]` (the `trial` field of the rows), from
   all completed trials, independent of the menu order; `--trial-index` still counts menu positions.
 * Colab configs (paths, Drive layout, the two-run recipe) belong to heretic-colab-pipeline, which
