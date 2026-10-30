@@ -20,10 +20,11 @@
 # OpenAI-compatible endpoint (api = "openai"; there, thinking cannot be switched off).
 # The prompts can be sensitive, so nothing is sent anywhere else unless configured.
 #
-# Used by the JudgeRate scorer (heretic.scorers.judge_rate), the re-ranking of the best
-# trials after the optimization (heretic.judge_ranking) and the heretic-judge command.
+# Used by the JudgeRate scorer (heretic.scorers.judge_rate) and the re-ranking of the best
+# trials after the optimization (heretic.judge_ranking), which judge inside the Heretic process.
+# Judging files (answers written by Heretic or refusal-eval) is refusal-eval's job
+# (judge.py / judge_colab.py batch); Heretic writes its answers in that format (heretic.rows).
 
-import argparse
 import ast
 import hashlib
 import json
@@ -32,7 +33,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -376,149 +377,3 @@ class JudgeResult:
     @property
     def rate(self) -> float:
         return self.refusals / len(self.labels) if self.labels else 0.0
-
-
-@dataclass
-class Comparison:
-    # (score name, evaluation) -> counts
-    keyword: dict[tuple[str, int], int]
-    judge: dict[tuple[str, int], int]
-    total: dict[tuple[str, int], int]
-    labels: dict[tuple[str, int], Counter]
-    # (keyword match, judge non-answer) -> count over all records
-    agreement: Counter
-
-
-def compare(
-    records: Iterable[dict[str, Any]], refusal_labels: Iterable[str]
-) -> Comparison:
-    """Keyword counts against judge counts, per score name and evaluation."""
-    refusal_labels = set(refusal_labels)
-    keyword: dict[tuple[str, int], int] = defaultdict(int)
-    judge: dict[tuple[str, int], int] = defaultdict(int)
-    total: dict[tuple[str, int], int] = defaultdict(int)
-    labels: dict[tuple[str, int], Counter] = defaultdict(Counter)
-    agreement: Counter = Counter()
-
-    for record in records:
-        key = (record.get("score_name", ""), int(record.get("evaluation", 0)))
-        refused = record["judge_label"] in refusal_labels
-        total[key] += 1
-        keyword[key] += int(bool(record["match"]))
-        judge[key] += int(refused)
-        labels[key][record["judge_label"]] += 1
-        agreement[(bool(record["match"]), refused)] += 1
-
-    return Comparison(dict(keyword), dict(judge), dict(total), dict(labels), agreement)
-
-
-def split_labels(value: str) -> tuple[str, ...]:
-    return tuple(label.strip() for label in value.split(",") if label.strip())
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="heretic-judge",
-        description=(
-            "Label the responses in a Heretic responses file (setting responses_file) with the "
-            "refusal-eval judge and compare its counts with the keyword counts."
-        ),
-    )
-    parser.add_argument("responses", help="JSON Lines file written by KeywordRate")
-    parser.add_argument(
-        "--output",
-        help="Write the records with judge_label, judge_reason and judge_prompt here",
-    )
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--api", choices=["ollama", "openai"], default="ollama")
-    parser.add_argument(
-        "--rubric",
-        help='"file.py:NAME" (e.g. refusal-eval/judge.py:SYSTEM_PROMPT) or a text file',
-    )
-    parser.add_argument(
-        "--message-format", choices=["refusal_eval", "template"], default="refusal_eval"
-    )
-    parser.add_argument("--labels", default=",".join(DEFAULT_LABELS))
-    parser.add_argument(
-        "--refusal-labels",
-        default=",".join(DEFAULT_REFUSAL_LABELS),
-        help="Labels that count as not answered",
-    )
-    parser.add_argument("--empty-label", default=DEFAULT_EMPTY_LABEL)
-    parser.add_argument("--timeout", type=float, default=180.0)
-    parser.add_argument(
-        "--evaluation",
-        type=int,
-        action="append",
-        help="Only these evaluation numbers (repeatable; 0 = baseline)",
-    )
-    args = parser.parse_args(argv)
-
-    from rich.console import Console
-    from rich.table import Table
-
-    labels = split_labels(args.labels)
-    refusal_labels = split_labels(args.refusal_labels)
-    if not set(refusal_labels) <= set(labels) or args.empty_label not in labels:
-        parser.error("--refusal-labels and --empty-label must be among --labels")
-
-    console = Console(highlight=False)
-    client = JudgeClient(
-        endpoint=args.endpoint,
-        model=args.model,
-        api=args.api,
-        message_format=args.message_format,
-        rubric=load_rubric(args.rubric),
-        labels=labels,
-        empty_label=args.empty_label,
-        timeout=args.timeout,
-    )
-    console.print(f"Judge prompt: {client.prompt_version}")
-
-    with open(args.responses, encoding="utf-8") as file:
-        records = [json.loads(line) for line in file if line.strip()]
-    if args.evaluation:
-        records = [r for r in records if int(r.get("evaluation", 0)) in args.evaluation]
-
-    for index, record in enumerate(records, start=1):
-        verdict = client.judge(record["prompt"], record["response"])
-        record["judge_label"] = verdict.label
-        record["judge_reason"] = verdict.reason
-        record["judge_prompt"] = client.prompt_version
-        if index % 25 == 0 or index == len(records):
-            console.print(f"Judged {index}/{len(records)}")
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as file:
-            for record in records:
-                file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    comparison = compare(records, refusal_labels)
-
-    table = Table()
-    for column in ("Score", "Evaluation", "Keyword", "Judge", *labels):
-        table.add_column(column, justify="right")
-    for key in sorted(comparison.total):
-        total = comparison.total[key]
-        table.add_row(
-            key[0],
-            str(key[1]),
-            f"{comparison.keyword[key]}/{total}",
-            f"{comparison.judge[key]}/{total}",
-            *(str(comparison.labels[key][label]) for label in labels),
-        )
-    console.print(table)
-
-    agreement = comparison.agreement
-    console.print(
-        f"Keyword match and judge non-answer: {agreement[(True, True)]}; "
-        f"keyword only (likely false positives): {agreement[(True, False)]}; "
-        f"judge only (missed by the keywords): {agreement[(False, True)]}; "
-        f"neither: {agreement[(False, False)]}"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

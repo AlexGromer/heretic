@@ -344,7 +344,7 @@ class Settings(BaseModel):
         default=None,
         description=(
             "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
-            "heretic-judge; or refusal-eval's responses.jsonl with response_direction_judged_file). "
+            "refusal-eval's responses.jsonl with response_direction_judged_file, or rows with judge_label). "
             "Adds a direction from the answer tokens: mean over the first response_tokens answer "
             "tokens of answers labelled response_bad_labels minus the same for "
             "response_good_labels (by default PARTIAL minus COMPLY), with its own weight "

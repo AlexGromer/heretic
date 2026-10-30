@@ -360,7 +360,8 @@ the JSON schema, temperature 0, seed 0, 3 retries, and the same parser. Labels R
 COMPLY, OFF_TOPIC; REFUSAL + PARTIAL count as not answered. Settings in `[scorer.JudgeRate]`
 (endpoint, model, `api = "openai"` for OpenAI-compatible servers, labels, rubric). Used by:
 
-* `heretic-judge responses.jsonl`: labels a `responses_file` and compares with the keyword counts;
+* (removed in branch `repo-split`: the `heretic-judge` command. Files are judged by refusal-eval's
+  `judge.py` / `judge_colab.py batch`; `responses_file` rows are in its format, see below);
 * scorer `JudgeRate` (`optimization = "none"`; judges every trial, slow);
 * **judge re-ranking** (`n_judge_ranking_trials = N`): after the optimization, the original model
   and the first N trials of the Pareto front with KL <= `judge_ranking_max_kl` generate answers to
@@ -372,7 +373,7 @@ COMPLY, OFF_TOPIC; REFUSAL + PARTIAL count as not answered. Settings in `[scorer
 
 `heretic-train-classifier --responses R.jsonl --judged J.jsonl --output classifiers/nonanswer`
 fine-tunes ModernBERT-base (as in upstream PR #500) on judged answers (refusal-eval files, joined by
-row key, or heretic-judge output); validation holds out whole prompts and reports Cohen's kappa
+row key, or rows with a label); validation holds out whole prompts and reports Cohen's kappa
 against the judge (4-class and answered / not answered) and warns below 0.75. Scorer
 `heretic.scorers.classifier_rate.ClassifierRate` (`model_path`) then scores 100 answers in seconds,
 so the optimization can minimize REFUSAL + PARTIAL instead of keyword refusals. Use
@@ -395,14 +396,14 @@ so the optimization can minimize REFUSAL + PARTIAL instead of keyword refusals. 
   Experimental.
 
 Additional directions are made orthonormal to the classic one, the good direction and each other,
-and each gets a weight in `direction_weight_range`. Answer files: heretic-judge output (prompt,
-response, judge_label), or refusal-eval `responses.jsonl` plus `judged.jsonl`
+and each gets a weight in `direction_weight_range`. Answer files: rows with prompt, response
+and judge_label / label, or refusal-eval `responses.jsonl` plus `judged.jsonl`
 (`*_judged_file`). Use answers to training prompts, not the evaluation hold-out.
 
 ## 4. DPO on the model's own answers
 
-`heretic-dpo-pairs generate | judge | pairs | train`: samples answers (default 4 per prompt,
-temperature 0.7), labels them with the same judge, builds pairs (chosen COMPLY, rejected PARTIAL or
+Answers are sampled and judged by refusal-eval (`generate_colab.py --sets bad_train --modes sample
+--samples 4`, then `judge_colab.py batch`); `heretic-dpo-pairs pairs --responses R --judged J` builds pairs (chosen COMPLY, rejected PARTIAL or
 REFUSAL, same prompt; cut-off chosen answers dropped) in TRL's conversational format, and trains a
 DPO LoRA (mlabonne's recipe: r64, alpha 32, lr 5e-6, 1 epoch, beta 0.1; `--merge` saves the merged
 model). `train` needs TRL (`uv pip install trl`, not a Heretic dependency). Whether DPO lowers
@@ -446,3 +447,18 @@ must not share the GPU with the evaluated model:
   generates its own `config.*.cyber.toml`; this branch only adds the Heretic code they can call.
 
 Tests: `tests/test_colab_handoff.py`.
+
+# Repository split (branch `repo-split`)
+
+To keep each job in one place:
+
+* **refusal-eval** generates evaluation and training answers (`generate_colab.py`, `generate_endpoint.py`), judges files
+  (`judge.py`, `judge_colab.py`), summarizes and compares runs, and owns the prompt sets, including
+  `val/orbench_val` (OR-Bench-hard prompts disjoint from its hold-out monitor).
+* **heretic** (this fork) changes the model and judges only inside its own process (JudgeRate, judge re-ranking). Answers
+  it writes (`responses_file`, `judge_ranking_output`) are refusal-eval responses rows (`heretic/rows.py`): `responses_file`
+  rows carry `trial` "base" / "e1", "e2", ... (evaluations of that scorer in this process), `set` = score name,
+  `match` (keyword verdict). Removed here: the `heretic-judge` command and `heretic-dpo-pairs generate` / `judge`.
+  `config.orbench.toml` reads `refusal-eval/val/orbench_val.txt` (a seeded Hub sample shared 8 of 100 prompts with the
+  hold-out monitor).
+* **heretic-colab-pipeline** runs both in Colab (configs, Drive layout, loop, stages).

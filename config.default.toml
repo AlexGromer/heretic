@@ -454,7 +454,7 @@ line_search = "strong_wolfe"
 # over the first response_tokens tokens of the visible answer is added to the bad I/O for answers
 # labelled response_bad_labels and to the good I/O for response_good_labels, so that the loss also
 # pulls the outputs of evasive answers towards those of real answers, where the evasion happens.
-# The file is written by heretic-judge (prompt, response, judge_label), or is refusal-eval's
+# The file has prompt, response and judge_label (or label) per row, or is refusal-eval's
 # responses.jsonl with response_io_judged_file = its judged.jsonl.
 # response_io_file = "runs/qwen3-8b-t18/responses.jsonl"
 # response_io_judged_file = "runs/qwen3-8b-t18/judged.jsonl"

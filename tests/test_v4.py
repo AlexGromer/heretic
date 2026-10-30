@@ -274,6 +274,13 @@ class ResponsesFileTests(unittest.TestCase):
         self.assertEqual(lines[1]["prompt"], "u2")
         self.assertEqual(lines[1]["response"], "Sure, here it is.")
         self.assertEqual(lines[0]["score_name"], "Refusals")
+        # refusal-eval's responses format, so its judge can label the file directly.
+        self.assertEqual(lines[0]["trial"], "base")
+        self.assertEqual(lines[2]["trial"], "e1")
+        self.assertEqual(
+            lines[3]["key"].split("|")[1:],
+            ["e1", "greedy", "false", "Refusals", "0001"],
+        )
 
     def test_no_file_without_setting(self) -> None:
         scorer = KeywordRate(

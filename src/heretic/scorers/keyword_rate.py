@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, PositiveInt, field_validator
 from rich.markup import escape
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
+from heretic.rows import model_label, response_row
 from heretic.scorer import Context, Score, Scorer
 from heretic.utils import format_dataset_specification, print
 
@@ -338,13 +339,32 @@ class KeywordRate(Scorer):
         evaluation = getattr(self, "_evaluation_count", 0)
         self._evaluation_count = evaluation + 1
 
+        # Rows in refusal-eval's responses format, so refusal-eval's judge can label them
+        # (trial "base" is the baseline evaluation, then e1, e2, ... per evaluation of this
+        # scorer in this process; set is the score name), plus the keyword verdict.
+        model_name = model_label(str(getattr(self.heretic_settings, "model", "")))
+        trial = "base" if evaluation == 0 else f"e{evaluation}"
+        settings = {
+            "generator": "heretic",
+            "max_new_tokens": getattr(
+                self.heretic_settings, "max_response_length", None
+            ),
+        }
         with open(path, "a", encoding="utf-8") as file:
-            for record in records:
-                line = {
-                    "evaluation": evaluation,
-                    "score_name": self.settings.score_name,
-                    **record,
-                }
+            for index, record in enumerate(records):
+                line = response_row(
+                    model_name=model_name,
+                    trial=trial,
+                    set_name=self.settings.score_name,
+                    prompt_id=f"{index:04d}",
+                    category="",
+                    prompt=record["prompt"],
+                    response=record["response"],
+                    settings={**settings, "system_prompt": record["system"]},
+                    evaluation=evaluation,
+                    score_name=self.settings.score_name,
+                    match=record["match"],
+                )
                 file.write(json.dumps(line, ensure_ascii=False) + "\n")
 
     @staticmethod

@@ -17,7 +17,7 @@
 #   direction is taken at the last instruction token ("instruction positions").
 #
 # Answers come from a JSON Lines file with prompt, response and label, as written by
-# heretic-judge (judge_label) or by refusal-eval (responses.jsonl joined with judged.jsonl).
+# refusal-eval (responses.jsonl joined with judged.jsonl), or rows that carry a judge_label / label.
 
 import json
 import random
@@ -80,7 +80,7 @@ def load_labelled_answers(
 ) -> list[LabelledAnswer]:
     """
     Answers with labels from `responses_path`. Without `judged_path`, every row needs its
-    label in `judge_label` (heretic-judge) or `label`. With `judged_path` (refusal-eval's
+    label in `judge_label` or `label`. With `judged_path` (refusal-eval's
     judged.jsonl, which has no prompts or responses), labels are joined by the row key.
     """
     rows = _read_jsonl(responses_path)

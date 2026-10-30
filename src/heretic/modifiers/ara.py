@@ -124,7 +124,7 @@ class Settings(BaseModel):
         default=None,
         description=(
             "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
-            "heretic-judge; or refusal-eval's responses.jsonl with response_io_judged_file). The "
+            "refusal-eval's responses.jsonl with response_io_judged_file, or rows with judge_label). The "
             "module I/O averaged over the first response_tokens answer tokens of answers labelled "
             "response_bad_labels is added to the bad I/O, that of response_good_labels to the "
             "good I/O (by default PARTIAL and COMPLY)."

@@ -12,12 +12,14 @@
 # QLoRA r64 / alpha 32, lr 5e-6, 1 epoch), which healed quality, not refusals; that DPO
 # reduces PARTIAL is a hypothesis to measure (judge, KL, GSM8K).
 #
-#   heretic-dpo-pairs generate --model merged/ --prompts offsec_train.txt --out samples.jsonl
-#   heretic-dpo-pairs judge --samples samples.jsonl --out judged.jsonl [--endpoint ...]
-#   heretic-dpo-pairs pairs --judged judged.jsonl --out pairs.jsonl
+# Sampling and judging are refusal-eval's job (one generator and one judge for everything):
+#
+#   refusal-eval: generate_colab.py --sets bad_train --modes sample --samples 4 --out R.jsonl
+#                 judge_colab.py batch --responses R.jsonl --out J.jsonl   (or judge.py batch)
+#   heretic-dpo-pairs pairs --responses R.jsonl --judged J.jsonl --out pairs.jsonl
 #   heretic-dpo-pairs train --model merged/ --pairs pairs.jsonl --output dpo-adapter/ [--merge merged-dpo/]
 #
-# Use training prompts that are not in the evaluation hold-out. `train` needs TRL
+# Use training prompts (refusal-eval train/), not the evaluation hold-out. `train` needs TRL
 # (uv pip install trl), which is not a dependency of Heretic.
 
 import argparse
@@ -28,16 +30,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from .judge import (
-    DEFAULT_ENDPOINT,
-    DEFAULT_MODEL,
-    DEFAULT_REFUSAL_LABELS,
-    JudgeClient,
-    JudgeError,
-    load_rubric,
-)
-
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+from .judge import DEFAULT_REFUSAL_LABELS
 
 
 def read_jsonl(path: str) -> list[dict[str, Any]]:
@@ -51,21 +44,6 @@ def write_jsonl(
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a" if append else "w", encoding="utf-8") as file:
         file.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
-
-
-def read_prompts(path: str) -> list[str]:
-    """A text file with one prompt per line, or JSON Lines with a "prompt" (or "text") field."""
-    if path.endswith(".jsonl"):
-        return [
-            str(row.get("prompt", row.get("text", "")))
-            for row in read_jsonl(path)
-            if row.get("prompt", row.get("text"))
-        ]
-    return [
-        line.strip()
-        for line in Path(path).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
 
 
 def build_pairs(
@@ -113,109 +91,6 @@ def build_pairs(
     return pairs
 
 
-def command_generate(args: argparse.Namespace) -> int:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    prompts = read_prompts(args.prompts)
-    tokenizer: Any = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model: Any = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype="auto", device_map=args.device_map
-    )
-    model.eval()
-    torch.manual_seed(args.seed)
-
-    jobs = [(i, s) for i in range(len(prompts)) for s in range(args.samples)]
-    done = set()
-    if Path(args.out).exists():
-        done = {(r["prompt_id"], r["sample"]) for r in read_jsonl(args.out)}
-    jobs = [job for job in jobs if job not in done]
-    print(f"{len(prompts)} prompts x {args.samples} samples, {len(jobs)} to generate")
-
-    for start in range(0, len(jobs), args.batch_size):
-        batch = jobs[start : start + args.batch_size]
-        texts = [
-            tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": args.system_prompt},
-                    {"role": "user", "content": prompts[i]},
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=args.thinking,
-            )
-            for i, _ in batch
-        ]
-        inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=True,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        new_tokens = outputs[:, inputs["input_ids"].shape[1] :]
-        rows = []
-        for (i, s), tokens in zip(batch, new_tokens):
-            stopped = bool((tokens == tokenizer.eos_token_id).any()) or bool(
-                (tokens == tokenizer.pad_token_id).any()
-            )
-            rows.append(
-                {
-                    "prompt_id": i,
-                    "sample": s,
-                    "system": args.system_prompt,
-                    "prompt": prompts[i],
-                    "response": tokenizer.decode(tokens, skip_special_tokens=True),
-                    "finish": "stop" if stopped else "length",
-                }
-            )
-        write_jsonl(args.out, rows, append=True)
-        print(f"{min(start + args.batch_size, len(jobs))}/{len(jobs)}")
-    return 0
-
-
-def command_judge(args: argparse.Namespace) -> int:
-    client = JudgeClient(
-        endpoint=args.endpoint, model=args.model, rubric=load_rubric(args.rubric)
-    )
-    rows = read_jsonl(args.samples)
-    done = set()
-    if Path(args.out).exists():
-        done = {(r["prompt_id"], r["sample"]) for r in read_jsonl(args.out)}
-    failed = 0
-    for index, row in enumerate(rows, start=1):
-        if (row["prompt_id"], row["sample"]) in done:
-            continue
-        try:
-            verdict = client.judge(row["prompt"], row["response"])
-        except JudgeError as error:
-            failed += 1
-            print(f"{row['prompt_id']}/{row['sample']}: {error}")
-            continue
-        write_jsonl(
-            args.out,
-            [
-                {
-                    **row,
-                    "judge_label": verdict.label,
-                    "judge_reason": verdict.reason,
-                    "judge_prompt": client.prompt_version,
-                }
-            ],
-            append=True,
-        )
-        if index % 25 == 0:
-            print(f"{index}/{len(rows)}")
-    print(f"done, {failed} failed (rerun to retry them)")
-    return 0 if failed == 0 else 2
-
-
 def join_refusal_eval(responses_path: str, judged_path: str) -> list[dict[str, Any]]:
     """
     refusal-eval responses.jsonl rows with the label of judged.jsonl (joined by row key),
@@ -247,11 +122,7 @@ def join_refusal_eval(responses_path: str, judged_path: str) -> list[dict[str, A
 
 
 def command_pairs(args: argparse.Namespace) -> int:
-    rows = (
-        join_refusal_eval(args.responses, args.judged)
-        if args.responses
-        else read_jsonl(args.judged)
-    )
+    rows = join_refusal_eval(args.responses, args.judged)
     pairs = build_pairs(
         rows,
         max_pairs_per_prompt=args.max_pairs_per_prompt,
@@ -331,46 +202,21 @@ def command_train(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="heretic-dpo-pairs",
-        description="Self-generated DPO pairs (COMPLY vs PARTIAL/REFUSAL) and DPO training.",
+        description=(
+            "DPO pairs (COMPLY vs PARTIAL/REFUSAL) from answers generated and judged by "
+            "refusal-eval, and DPO training."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    generate = sub.add_parser("generate", help="sample answers from a model")
-    generate.add_argument(
-        "--model", required=True, help="merged model directory or HF ID"
-    )
-    generate.add_argument("--prompts", required=True, help="text file or JSON Lines")
-    generate.add_argument("--out", required=True)
-    generate.add_argument("--samples", type=int, default=4)
-    generate.add_argument("--temperature", type=float, default=0.7)
-    generate.add_argument("--top-p", type=float, default=0.95)
-    generate.add_argument("--max-new-tokens", type=int, default=512)
-    generate.add_argument("--batch-size", type=int, default=8)
-    generate.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
-    generate.add_argument(
-        "--thinking", action="store_true", help="enable_thinking in the chat template"
-    )
-    generate.add_argument("--device-map", default="auto")
-    generate.add_argument("--seed", type=int, default=1234)
-
-    judge = sub.add_parser(
-        "judge", help="label the samples with the refusal-eval judge"
-    )
-    judge.add_argument("--samples", required=True)
-    judge.add_argument("--out", required=True)
-    judge.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    judge.add_argument("--model", default=DEFAULT_MODEL)
-    judge.add_argument("--rubric", help='e.g. "../refusal-eval/judge.py:SYSTEM_PROMPT"')
-
     pairs = sub.add_parser("pairs", help="build DPO pairs from judged samples")
     pairs.add_argument(
-        "--judged",
+        "--responses",
         required=True,
-        help="heretic-dpo-pairs judge output, or refusal-eval judged.jsonl with --responses",
+        help="refusal-eval responses.jsonl (e.g. generate_colab.py --sets bad_train --samples 4)",
     )
     pairs.add_argument(
-        "--responses",
-        help="refusal-eval responses.jsonl (e.g. generate_colab.py --sets bad_train --samples 4)",
+        "--judged", required=True, help="refusal-eval judged.jsonl of those responses"
     )
     pairs.add_argument("--out", required=True)
     pairs.add_argument("--max-pairs-per-prompt", type=int, default=2)
@@ -394,8 +240,6 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     return {
-        "generate": command_generate,
-        "judge": command_judge,
         "pairs": command_pairs,
         "train": command_train,
     }[args.command](args)

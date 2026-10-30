@@ -12,7 +12,7 @@
 #       [--responses ... --judged ...] --output classifiers/nonanswer
 #
 # Training data: refusal-eval responses.jsonl joined with judged.jsonl, or files written by
-# heretic-judge (prompt, response, judge_label). Validation holds out whole prompts (an answer
+# rows with prompt, response and judge_label / label. Validation holds out whole prompts (an answer
 # of the same prompt from another trial must not be in both sets) and reports Cohen's kappa
 # against the judge, 4-class and for answered vs not answered. Use the classifier only if the
 # binary kappa is high (refusal-eval gates its judge at 0.75).
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         "--responses",
         action="append",
         required=True,
-        help="Answers (refusal-eval responses.jsonl or heretic-judge output); repeatable",
+        help="Answers (refusal-eval responses.jsonl, or rows with a label); repeatable",
     )
     parser.add_argument(
         "--judged",

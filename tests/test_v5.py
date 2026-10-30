@@ -8,11 +8,8 @@
 import io
 import json
 import sys
-import tempfile
-import threading
 import unittest
 from contextlib import redirect_stdout
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,8 +26,7 @@ from heretic.directions import (
     orthonormal_extension,
     train_som,
 )
-from heretic.judge import JudgeClient, compare
-from heretic.judge import main as judge_main
+from heretic.judge import JudgeClient
 from heretic.merged_scoring import (
     MERGED_SCORES_ATTR,
     rank_by_merged_scores,
@@ -420,33 +416,6 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(client.classify("p", "  "), "OFF_TOPIC")
         self.assertEqual(fake.requests, 1)
 
-    def test_compare(self) -> None:
-        records = [
-            {
-                "score_name": "R",
-                "evaluation": 1,
-                "match": True,
-                "judge_label": "COMPLY",
-            },
-            {
-                "score_name": "R",
-                "evaluation": 1,
-                "match": True,
-                "judge_label": "REFUSAL",
-            },
-            {
-                "score_name": "R",
-                "evaluation": 1,
-                "match": False,
-                "judge_label": "PARTIAL",
-            },
-        ]
-        comparison = compare(records, ["REFUSAL", "PARTIAL"])
-        self.assertEqual(comparison.keyword[("R", 1)], 2)
-        self.assertEqual(comparison.judge[("R", 1)], 2)
-        self.assertEqual(comparison.agreement[(True, False)], 1)
-        self.assertEqual(comparison.agreement[(False, True)], 1)
-
     def test_scorer(self) -> None:
         scorer = JudgeRate(
             heretic_settings=Settings.model_construct(),
@@ -466,74 +435,6 @@ class JudgeTests(unittest.TestCase):
         # The reasoning is removed before judging, so the first answer complies.
         self.assertAlmostEqual(score.value, 2 / 3)
         self.assertFalse(scorer.reproducible)
-
-    def test_cli_against_a_local_server(self) -> None:
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                content = body["messages"][1]["content"]
-                label = "REFUSAL" if "nope" in content else "COMPLY"
-                reply = json.dumps(
-                    {
-                        "message": {
-                            "content": json.dumps({"label": label, "reason": "r"})
-                        }
-                    }
-                )
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(reply.encode())
-
-            def log_message(self, format: str, *args: Any) -> None:
-                pass
-
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                responses = Path(directory, "responses.jsonl")
-                output = Path(directory, "labelled.jsonl")
-                rows = [(0, "nope", True), (1, "here it is", True), (1, "nope", True)]
-                responses.write_text(
-                    "".join(
-                        json.dumps(
-                            {
-                                "evaluation": evaluation,
-                                "score_name": "Refusals",
-                                "prompt": "p",
-                                "response": response,
-                                "match": match,
-                            }
-                        )
-                        + "\n"
-                        for evaluation, response, match in rows
-                    ),
-                    encoding="utf-8",
-                )
-                endpoint = f"http://127.0.0.1:{server.server_address[1]}"
-                with redirect_stdout(io.StringIO()):
-                    judge_main(
-                        [
-                            str(responses),
-                            "--endpoint",
-                            endpoint,
-                            "--output",
-                            str(output),
-                            "--evaluation",
-                            "1",
-                        ]
-                    )
-                labelled = [
-                    json.loads(line)
-                    for line in output.read_text(encoding="utf-8").splitlines()
-                ]
-        finally:
-            server.shutdown()
-
-        self.assertEqual([r["judge_label"] for r in labelled], ["COMPLY", "REFUSAL"])
-        self.assertEqual(labelled[0]["judge_prompt"], "v1-039fd0fa")
 
     @unittest.skipIf(sys.version_info < (3, 11), "tomllib needs Python 3.11")
     def test_default_config_section(self) -> None:

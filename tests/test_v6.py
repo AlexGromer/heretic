@@ -256,6 +256,7 @@ class JudgeRankingTests(unittest.TestCase):
             prompts_file = Path(directory, "prompts.txt")
             prompts_file.write_text("a\nb\n", encoding="utf-8")
             settings = Settings.model_construct(
+                model="org/Tiny",
                 n_judge_ranking_trials=2,
                 judge_ranking_merged=False,
                 judge_ranking_max_kl=0.15,
@@ -609,7 +610,7 @@ class DpoTests(unittest.TestCase):
         self.assertEqual(pairs[0]["prompt"], [{"role": "user", "content": "p"}])
         self.assertEqual(len(build_pairs(rows, drop_truncated_chosen=False)), 2)
 
-    def test_generate_and_train_on_tiny_model(self) -> None:
+    def test_train_on_tiny_model(self) -> None:
         try:
             import trl  # noqa: F401
         except ImportError:
@@ -618,36 +619,6 @@ class DpoTests(unittest.TestCase):
 
         model = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         with tempfile.TemporaryDirectory() as directory:
-            prompts = Path(directory, "prompts.txt")
-            prompts.write_text("first question\nsecond question\n", encoding="utf-8")
-            samples = Path(directory, "samples.jsonl")
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(
-                    dpo_main(
-                        [
-                            "generate",
-                            "--model",
-                            model,
-                            "--prompts",
-                            str(prompts),
-                            "--out",
-                            str(samples),
-                            "--samples",
-                            "2",
-                            "--max-new-tokens",
-                            "8",
-                            "--device-map",
-                            "cpu",
-                        ]
-                    ),
-                    0,
-                )
-            rows = [
-                json.loads(line)
-                for line in samples.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(len(rows), 4)
-
             pairs = Path(directory, "pairs.jsonl")
             pair = {
                 "prompt": [{"role": "user", "content": "first question"}],

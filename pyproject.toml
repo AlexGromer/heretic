@@ -59,7 +59,6 @@ Changelog = "https://github.com/p-e-w/heretic/releases"
 [project.scripts]
 heretic = "heretic.main:main"
 heretic-generalization = "heretic.generalization:main"
-heretic-judge = "heretic.judge:main"
 heretic-train-classifier = "heretic.classifier:main"
 heretic-dpo-pairs = "heretic.dpo:main"
 
