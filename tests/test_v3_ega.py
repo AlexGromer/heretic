@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 import torch
 import torch.nn.functional as F
 from pydantic import ValidationError
@@ -50,6 +51,33 @@ GOOD = [
     Prompt(system="s", user=u)
     for u in ("d d", "eee", "ff ff ff ff", "name a color", "say hello")
 ]
+
+# Assertion helpers for the module-level (pytest) tests.
+check = unittest.TestCase()
+check.maxDiff = None
+
+
+@pytest.fixture
+def fresh_model():
+    """
+    Factory for freshly loaded tiny models (the tests apply LoRA adapters and edit
+    fused experts). The cached model is invalidated afterwards, so that other
+    test modules reload it.
+    """
+    created: list[Model] = []
+
+    def make(dtype: str = "float32") -> Model:
+        model = get_model(dtype)
+        model.needs_reload = True
+        model.reset_model()
+        created.append(model)
+        return model
+
+    yield make
+
+    for model in created:
+        model.settings.seed = None
+        model.needs_reload = True
 
 
 class FreshModelTestCase(unittest.TestCase):
@@ -302,93 +330,6 @@ class EgaModelTests(FreshModelTestCase):
             # 5 prompts, 2 positions, every token goes to top_k distinct experts.
             self.assertEqual(int(counts.sum()), len(BAD) * 2 * top_k)
 
-    def test_per_expert_directions(self) -> None:
-        model = self.fresh_model()
-        plans = get_plans(model)
-        before = fused_tensors(model)
-        layers = len(model.get_layers())
-
-        with redirect_stdout(io.StringIO()):
-            bad_statistics = collect_expert_statistics(model, BAD, 2)
-
-        # Each routed expert has its own direction: the unit directions of the experts
-        # that have enough data of their own are not all the same.
-        own_directions = []
-        for layer_index in range(layers):
-            plan = plans[(layer_index, COMPONENT)]
-            used = set(plan.used_experts())
-            routed = {
-                int(e)
-                for e in torch.nonzero(
-                    bad_statistics[(layer_index, COMPONENT)].count > 0
-                ).flatten()
-            }
-            self.assertEqual(used, routed)
-            # Unused experts have no direction and no strength.
-            for expert in range(plan.scales.shape[0]):
-                if expert not in used:
-                    self.assertEqual(plan.scales[expert].item(), 0.0)
-                    self.assertEqual(plan.directions[expert].abs().sum().item(), 0.0)
-            for expert in used:
-                self.assertGreater(plan.scales[expert].item(), 0.0)
-                self.assertLessEqual(plan.scales[expert].item(), 1.0)
-                if not plan.fallback[expert]:
-                    direction = plan.directions[expert]
-                    self.assertAlmostEqual(direction.norm().item(), 1.0, places=5)
-                    own_directions.append(direction)
-            # Not all experts are used (so the test is meaningful) ...
-            self.assertLess(len(used), plan.scales.shape[0])
-
-        # ... several experts have their own direction, and they differ.
-        self.assertGreater(len(own_directions), 5)
-        stacked = torch.stack(own_directions)
-        similarities = stacked @ stacked.T
-        off_diagonal = similarities[~torch.eye(len(stacked), dtype=torch.bool)]
-        self.assertLess(off_diagonal.min().item(), 0.99)
-        self.assertGreater(
-            len({tuple(round(x, 4) for x in d.tolist()) for d in own_directions}),
-            len(own_directions) // 2,
-        )
-
-        # Applying the plan changes exactly the experts that harmful prompts use.
-        modifier = make_modifier(model, plans, ega=True)
-        model.apply_lora(1)
-        with redirect_stdout(io.StringIO()):
-            modifier.modify_model(context_for(model), full_strength_parameters(layers))
-
-        after = fused_tensors(model)
-        for layer_index in range(layers):
-            key = (layer_index, COMPONENT)
-            used = set(plans[key].used_experts())
-            changed = {
-                expert
-                for expert in range(before[key].shape[0])
-                if not torch.equal(before[key][expert], after[key][expert])
-            }
-            self.assertEqual(changed, used)
-
-        # Each used expert lost (part of) its own direction, scaled by its strength:
-        # with row normalization "none" and full strength the component is removed.
-        reload(model)
-        modifier = make_modifier(
-            model, plans, ega=True, row_normalization=RowNormalization.NONE
-        )
-        model.apply_lora(1)
-        with redirect_stdout(io.StringIO()):
-            modifier.modify_model(context_for(model), full_strength_parameters(layers))
-        fused = model.get_layer_fused_experts(0)[COMPONENT][0]
-        plan = plans[(0, COMPONENT)]
-        for expert in plan.used_experts():
-            if plan.fallback[expert]:
-                continue
-            v = plan.directions[expert]
-            scale = plan.scales[expert].item()
-            original = before[(0, COMPONENT)][expert]
-            expected = original - scale * torch.outer(v, v @ original)
-            torch.testing.assert_close(
-                fused.parameter[expert].detach(), expected, rtol=1e-4, atol=1e-5
-            )
-
     def test_shared_expert_is_ablated_like_a_dense_mlp(self) -> None:
         # EGA does not change what happens to the shared expert / attention outputs.
         model = self.fresh_model()
@@ -415,83 +356,6 @@ class EgaModelTests(FreshModelTestCase):
         for a, b in zip(with_ega, without_ega):
             self.assertTrue(torch.equal(a, b))
 
-    def test_ega_off_parity(self) -> None:
-        # ega = false: the fused experts are ablated exactly like in v2, with the layer
-        # direction and the layer weight for all experts, whatever plans exist.
-        model = self.fresh_model()
-        plans = get_plans(model)
-        layers = len(model.get_layers())
-        before = fused_tensors(model)
-
-        modifier = make_modifier(model, plans, ega=False)
-        model.apply_lora(1)
-        with redirect_stdout(io.StringIO()):
-            modifier.modify_model(context_for(model), full_strength_parameters(layers))
-        after = fused_tensors(model)
-
-        for layer_index in range(layers):
-            key = (layer_index, COMPONENT)
-            expected = before[key].clone()
-            # Weight 1.0 everywhere; direction_index None means the layer's own direction.
-            ablate_fused_experts(
-                expected,
-                1,
-                modifier.residual_directions[layer_index + 1],
-                1.0,
-                RowNormalization.PRE,
-            )
-            self.assertTrue(torch.equal(after[key], expected), key)
-            # Every expert changed (no per-expert selection).
-            self.assertTrue(
-                all(
-                    not torch.equal(before[key][e], after[key][e])
-                    for e in range(before[key].shape[0])
-                )
-            )
-
-        # A modifier that never computed plans behaves the same.
-        reload(model)
-        fresh = make_modifier(model, {}, ega=False)
-        del fresh.ega_plans
-        model.apply_lora(1)
-        with redirect_stdout(io.StringIO()):
-            fresh.modify_model(context_for(model), full_strength_parameters(layers))
-        for key, tensor in fused_tensors(model).items():
-            self.assertTrue(torch.equal(tensor, after[key]))
-
-    def test_restore_between_trials(self) -> None:
-        # Edit with EGA, reset like the optimizer does between trials, and compare
-        # bit-exactly (also in bfloat16, where arithmetic undo would not work).
-        for dtype in ("float32", "bfloat16"):
-            with self.subTest(dtype=dtype):
-                model = self.fresh_model(dtype)
-                plans = get_plans(model)
-                layers = len(model.get_layers())
-                before = fused_tensors(model)
-
-                modifier = make_modifier(
-                    model, plans, ega=True, row_normalization=RowNormalization.FULL
-                )
-                model.apply_lora(modifier.lora_rank)
-                ctx = context_for(model)
-                for trial in range(2):
-                    with redirect_stdout(io.StringIO()):
-                        modifier.modify_model(ctx, full_strength_parameters(layers))
-                    changed = fused_tensors(model)
-                    self.assertTrue(
-                        any(
-                            not torch.equal(before[key], changed[key]) for key in before
-                        )
-                    )
-                    self.assertTrue(model.has_modified_fused_experts())
-
-                    modifier.reset_model(ctx)
-
-                    self.assertFalse(model.has_modified_fused_experts())
-                    restored = fused_tensors(model)
-                    for key in before:
-                        self.assertTrue(torch.equal(before[key], restored[key]), key)
-
     def test_ega_setting_without_fused_experts_is_harmless(self) -> None:
         # The setting is part of the modifier settings; it must validate and default off.
         settings = AbliterationSettings()
@@ -501,6 +365,171 @@ class EgaModelTests(FreshModelTestCase):
             AbliterationSettings(ega_last_positions=0)
         with self.assertRaises(ValidationError):
             AbliterationSettings.model_validate({"ega_frequency_scaling": "sometimes"})
+
+
+def test_per_expert_directions(fresh_model: Any) -> None:
+    model = fresh_model()
+    plans = get_plans(model)
+    before = fused_tensors(model)
+    layers = len(model.get_layers())
+
+    with redirect_stdout(io.StringIO()):
+        bad_statistics = collect_expert_statistics(model, BAD, 2)
+
+    # Each routed expert has its own direction: the unit directions of the experts
+    # that have enough data of their own are not all the same.
+    own_directions = []
+    for layer_index in range(layers):
+        plan = plans[(layer_index, COMPONENT)]
+        used = set(plan.used_experts())
+        routed = {
+            int(e)
+            for e in torch.nonzero(
+                bad_statistics[(layer_index, COMPONENT)].count > 0
+            ).flatten()
+        }
+        check.assertEqual(used, routed)
+        # Unused experts have no direction and no strength.
+        for expert in range(plan.scales.shape[0]):
+            if expert not in used:
+                check.assertEqual(plan.scales[expert].item(), 0.0)
+                check.assertEqual(plan.directions[expert].abs().sum().item(), 0.0)
+        for expert in used:
+            check.assertGreater(plan.scales[expert].item(), 0.0)
+            check.assertLessEqual(plan.scales[expert].item(), 1.0)
+            if not plan.fallback[expert]:
+                direction = plan.directions[expert]
+                check.assertAlmostEqual(direction.norm().item(), 1.0, places=5)
+                own_directions.append(direction)
+        # Not all experts are used (so the test is meaningful) ...
+        check.assertLess(len(used), plan.scales.shape[0])
+
+    # ... several experts have their own direction, and they differ.
+    check.assertGreater(len(own_directions), 5)
+    stacked = torch.stack(own_directions)
+    similarities = stacked @ stacked.T
+    off_diagonal = similarities[~torch.eye(len(stacked), dtype=torch.bool)]
+    check.assertLess(off_diagonal.min().item(), 0.99)
+    check.assertGreater(
+        len({tuple(round(x, 4) for x in d.tolist()) for d in own_directions}),
+        len(own_directions) // 2,
+    )
+
+    # Applying the plan changes exactly the experts that harmful prompts use.
+    modifier = make_modifier(model, plans, ega=True)
+    model.apply_lora(1)
+    with redirect_stdout(io.StringIO()):
+        modifier.modify_model(context_for(model), full_strength_parameters(layers))
+
+    after = fused_tensors(model)
+    for layer_index in range(layers):
+        key = (layer_index, COMPONENT)
+        used = set(plans[key].used_experts())
+        changed = {
+            expert
+            for expert in range(before[key].shape[0])
+            if not torch.equal(before[key][expert], after[key][expert])
+        }
+        check.assertEqual(changed, used)
+
+    # Each used expert lost (part of) its own direction, scaled by its strength:
+    # with row normalization "none" and full strength the component is removed.
+    reload(model)
+    modifier = make_modifier(
+        model, plans, ega=True, row_normalization=RowNormalization.NONE
+    )
+    model.apply_lora(1)
+    with redirect_stdout(io.StringIO()):
+        modifier.modify_model(context_for(model), full_strength_parameters(layers))
+    fused = model.get_layer_fused_experts(0)[COMPONENT][0]
+    plan = plans[(0, COMPONENT)]
+    for expert in plan.used_experts():
+        if plan.fallback[expert]:
+            continue
+        v = plan.directions[expert]
+        scale = plan.scales[expert].item()
+        original = before[(0, COMPONENT)][expert]
+        expected = original - scale * torch.outer(v, v @ original)
+        torch.testing.assert_close(
+            fused.parameter[expert].detach(), expected, rtol=1e-4, atol=1e-5
+        )
+
+
+def test_ega_off_parity(fresh_model: Any) -> None:
+    # ega = false: the fused experts are ablated exactly like in v2, with the layer
+    # direction and the layer weight for all experts, whatever plans exist.
+    model = fresh_model()
+    plans = get_plans(model)
+    layers = len(model.get_layers())
+    before = fused_tensors(model)
+
+    modifier = make_modifier(model, plans, ega=False)
+    model.apply_lora(1)
+    with redirect_stdout(io.StringIO()):
+        modifier.modify_model(context_for(model), full_strength_parameters(layers))
+    after = fused_tensors(model)
+
+    for layer_index in range(layers):
+        key = (layer_index, COMPONENT)
+        expected = before[key].clone()
+        # Weight 1.0 everywhere; direction_index None means the layer's own direction.
+        ablate_fused_experts(
+            expected,
+            1,
+            modifier.residual_directions[layer_index + 1],
+            1.0,
+            RowNormalization.PRE,
+        )
+        check.assertTrue(torch.equal(after[key], expected), key)
+        # Every expert changed (no per-expert selection).
+        check.assertTrue(
+            all(
+                not torch.equal(before[key][e], after[key][e])
+                for e in range(before[key].shape[0])
+            )
+        )
+
+    # A modifier that never computed plans behaves the same.
+    reload(model)
+    fresh = make_modifier(model, {}, ega=False)
+    del fresh.ega_plans
+    model.apply_lora(1)
+    with redirect_stdout(io.StringIO()):
+        fresh.modify_model(context_for(model), full_strength_parameters(layers))
+    for key, tensor in fused_tensors(model).items():
+        check.assertTrue(torch.equal(tensor, after[key]))
+
+
+def test_restore_between_trials(fresh_model: Any) -> None:
+    # Edit with EGA, reset like the optimizer does between trials, and compare
+    # bit-exactly (also in bfloat16, where arithmetic undo would not work).
+    for dtype in ("float32", "bfloat16"):
+        with check.subTest(dtype=dtype):
+            model = fresh_model(dtype)
+            plans = get_plans(model)
+            layers = len(model.get_layers())
+            before = fused_tensors(model)
+
+            modifier = make_modifier(
+                model, plans, ega=True, row_normalization=RowNormalization.FULL
+            )
+            model.apply_lora(modifier.lora_rank)
+            ctx = context_for(model)
+            for trial in range(2):
+                with redirect_stdout(io.StringIO()):
+                    modifier.modify_model(ctx, full_strength_parameters(layers))
+                changed = fused_tensors(model)
+                check.assertTrue(
+                    any(not torch.equal(before[key], changed[key]) for key in before)
+                )
+                check.assertTrue(model.has_modified_fused_experts())
+
+                modifier.reset_model(ctx)
+
+                check.assertFalse(model.has_modified_fused_experts())
+                restored = fused_tensors(model)
+                for key in before:
+                    check.assertTrue(torch.equal(before[key], restored[key]), key)
 
 
 if __name__ == "__main__":
