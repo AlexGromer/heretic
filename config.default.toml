@@ -610,6 +610,12 @@ whitening_shrinkage = 0.1
 # paired sets like "whitened" above.
 extra_direction_source = "som"
 
+# Precision of the per-prompt residuals the paired estimators keep in system memory.
+# "float16" halves it, but whitening amplifies the axes along which the pairs barely vary and is
+# sensitive to that precision (on the CPU test model the two directions agree to a cosine of about
+# 0.94), so use it only when the memory forces it. The statistics are computed in float32/float64.
+paired_residuals_dtype = "float32"
+
 # Number of refusal directions per layer (fork addition, upstream issue #140, "SOM Directions
 # are Better than One", arXiv 2511.08379). 1 is classic abliteration. With more, a
 # self-organizing map is fitted to the bad-prompt residuals of every layer; the differences

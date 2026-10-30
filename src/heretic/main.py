@@ -207,7 +207,7 @@ def obtain_export_strategy(
 
     return ask_if_unset(
         settings.export_strategy,
-        questionary.select(
+        lambda: questionary.select(
             "How do you want to export the model?",
             choices=[
                 Choice(
@@ -429,7 +429,7 @@ def run():
 
         action = ask_if_unset(
             settings.checkpoint_action,
-            questionary.select(
+            lambda: questionary.select(
                 "How would you like to proceed?",
                 choices=choices,
                 style=Style([("highlighted", "reverse")]),
@@ -996,7 +996,7 @@ def run():
                     else None
                     if settings.trial_index is None
                     else sorted_trials[settings.trial_index],
-                    questionary.select(
+                    lambda: questionary.select(
                         "Which trial do you want to use?",
                         choices=choices,
                         style=Style([("highlighted", "reverse")]),
@@ -1012,7 +1012,7 @@ def run():
                         try:
                             n_additional_trials = ask_if_unset(
                                 settings.n_additional_trials,
-                                questionary.text(
+                                lambda: questionary.text(
                                     "How many additional trials do you want to run?"
                                 ),
                                 setting="n_additional_trials",
@@ -1083,7 +1083,7 @@ def run():
 
                 action = ask_if_unset(
                     settings.model_action,
-                    questionary.select(
+                    lambda: questionary.select(
                         "What do you want to do with the decensored model?",
                         choices=[
                             Choice(
@@ -1128,7 +1128,7 @@ def run():
                         case "save":
                             save_directory = ask_if_unset(
                                 settings.save_directory,
-                                questionary.path(
+                                lambda: questionary.path(
                                     "Path to the folder:",
                                     only_directories=True,
                                 ),
@@ -1202,7 +1202,9 @@ def run():
                                 #       For scripting, the correct way to set the token is through the HF_TOKEN
                                 #       environment variable, or through the HF token file.
                                 token = ask(
-                                    questionary.password("Hugging Face access token:"),
+                                    lambda: questionary.password(
+                                        "Hugging Face access token:"
+                                    ),
                                     hint="Set the HF_TOKEN environment variable.",
                                 )
                             if not token:
@@ -1218,7 +1220,7 @@ def run():
 
                             repo_id = ask_if_unset(
                                 settings.upload_repo_id,
-                                questionary.text(
+                                lambda: questionary.text(
                                     "Name of repository:",
                                     default=f"{user['name']}/{Path(settings.model).name}-heretic",
                                 ),
@@ -1235,7 +1237,7 @@ def run():
                                     if settings.upload_repo_private
                                     else "Public"
                                 ),
-                                questionary.select(
+                                lambda: questionary.select(
                                     "Should the repository be public or private?",
                                     choices=[
                                         "Public",
@@ -1288,7 +1290,7 @@ def run():
 
                                 reproducibility_information = ask_if_unset(
                                     settings.upload_reproducibility_information,
-                                    questionary.select(
+                                    lambda: questionary.select(
                                         "Which reproducibility information do you want to add?",
                                         choices=[
                                             Choice(
@@ -1479,7 +1481,7 @@ def run():
                             while True:
                                 try:
                                     message = ask(
-                                        questionary.text(
+                                        lambda: questionary.text(
                                             "User:",
                                             qmark=">",
                                         ),
@@ -1500,7 +1502,7 @@ def run():
 
                         case "benchmark":
                             benchmarks = ask(
-                                questionary.checkbox(
+                                lambda: questionary.checkbox(
                                     "Which benchmarks do you want to run?",
                                     [
                                         Choice(
@@ -1516,7 +1518,7 @@ def run():
                                 continue
 
                             scope = ask(
-                                questionary.select(
+                                lambda: questionary.select(
                                     (
                                         "Do you want to benchmark the original model along with the decensored model? "
                                         "Benchmarking both models allows you to compare the scores, but it takes twice as much time."

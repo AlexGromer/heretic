@@ -37,7 +37,7 @@ from .model import (
     _collapse_flattened_residual_streams,
     strftime_fixed_date,
 )
-from .utils import Prompt, batchify, print
+from .utils import Prompt, batchify, detect_lang, print
 
 
 @dataclass
@@ -195,6 +195,43 @@ def answer_positions(
         if start >= len(prompt_text) and end > start
     ][:count]
     return PositionedText(input_ids, positions or [len(input_ids) - 1])
+
+
+def pair_diagnostics(
+    model: Model, bad: Sequence[Prompt], good: Sequence[Prompt]
+) -> dict[str, int]:
+    """
+    How well the prompts at the same index are matched, for prompt sets meant to be
+    counterfactual pairs: how many pairs share a language, and how many share the last
+    token of the user instruction. The second one matters for the direction: the hidden
+    state the directions are read from sits at the end of the rendered prompt, whose last
+    tokens come from the chat template and are the same for every prompt, so what differs
+    there is the instruction's own final token.
+    """
+    pairs = min(len(bad), len(good))
+    last_tokens = 0
+    for index in range(pairs):
+        ends = []
+        for prompt in (bad[index], good[index]):
+            item = instruction_end_position(model, prompt)
+            ends.append(item.input_ids[item.positions[0]] if item.input_ids else None)
+        last_tokens += int(ends[0] is not None and ends[0] == ends[1])
+    return {
+        "pairs": pairs,
+        "languages": sum(
+            detect_lang(bad[i].user) == detect_lang(good[i].user) for i in range(pairs)
+        ),
+        "last_tokens": last_tokens,
+    }
+
+
+def format_pair_diagnostics(counts: dict[str, int]) -> str:
+    pairs = counts["pairs"]
+    return (
+        f"[bold]{pairs}[/] pairs, same language in [bold]{counts['languages']}[/], "
+        f"same last instruction token in [bold]{counts['last_tokens']}[/] "
+        "(what the directions are read after)"
+    )
 
 
 def thinking_positions(

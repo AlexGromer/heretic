@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import bitsandbytes.functional as BNB_F
 import torch
@@ -42,9 +42,11 @@ from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT, Model
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.positions import (
     answer_positions,
+    format_pair_diagnostics,
     instruction_end_position,
     load_answer_items,
     load_labelled_answers,
+    pair_diagnostics,
     position_direction,
     split_answers,
     thinking_positions,
@@ -360,6 +362,18 @@ class Settings(BaseModel):
             "Ridge of the whitening, as a fraction of the mean eigenvalue of the covariance. "
             "There are fewer pairs than dimensions, so the covariance is singular and a ridge "
             "is required; a larger value moves the direction back towards mean_diff."
+        ),
+    )
+
+    paired_residuals_dtype: Literal["float32", "float16"] = Field(
+        default="float32",
+        description=(
+            "Precision of the per-prompt residuals that the paired estimators keep in system "
+            'memory. "float16" halves that memory (prompts * (layers + 1) * hidden * 2 bytes '
+            "per set); the statistics themselves are still computed in float32 or float64. "
+            "Whitening amplifies the axes along which the pairs barely vary, so it is sensitive "
+            "to that precision: on the CPU test model the whitened directions of float16 and "
+            "float32 agree only to a cosine of about 0.94. Use it when the memory forces it."
         ),
     )
 
@@ -690,29 +704,41 @@ class Abliteration(Modifier[Parameters]):
                     f"{len(good_prompts)} good prompts. Use paired sets (the evaluation harness "
                     "train/bad_train and train/good_train) or mean_diff / som."
                 )
+            rows = len(model.get_layers()) + 1
+            hidden = model.model.config.get_text_config().hidden_size
+            element = 2 if self.settings.paired_residuals_dtype == "float16" else 4
             print(
                 f"* Obtaining per-prompt residuals of {len(bad_prompts)} prompt pairs "
-                "(both sets are kept in memory)..."
-            )
-            languages = sum(
-                detect_lang(bad.user) == detect_lang(good.user)
-                for bad, good in zip(bad_prompts, good_prompts)
+                f"(about {2 * len(bad_prompts) * rows * hidden * element / 2**30:.2f} GiB "
+                f"of {self.settings.paired_residuals_dtype} in system memory)..."
             )
             print(
-                f"  * Pairs whose two prompts share a language: [bold]{languages}[/]"
-                f"/{len(bad_prompts)}"
+                f"  * {format_pair_diagnostics(pair_diagnostics(model, bad_prompts, good_prompts))}"
             )
-            bad_residuals = model.get_residuals_batched(
-                bad_prompts,
-                winsorization_quantile=self.settings.winsorization_quantile,
-            ).cpu()
-            good_residuals = model.get_residuals_batched(
-                good_prompts,
-                winsorization_quantile=self.settings.winsorization_quantile,
-            ).cpu()
-            differences = paired_differences(bad_residuals, good_residuals)
-            good_means = good_residuals.mean(dim=0)
-            bad_means = bad_residuals.mean(dim=0)
+            dtype = (
+                torch.float16
+                if self.settings.paired_residuals_dtype == "float16"
+                else torch.float32
+            )
+            bad_residuals = (
+                model.get_residuals_batched(
+                    bad_prompts,
+                    winsorization_quantile=self.settings.winsorization_quantile,
+                )
+                .cpu()
+                .to(dtype)
+            )
+            good_residuals = (
+                model.get_residuals_batched(
+                    good_prompts,
+                    winsorization_quantile=self.settings.winsorization_quantile,
+                )
+                .cpu()
+                .to(dtype)
+            )
+            differences = paired_differences(bad_residuals, good_residuals).float()
+            good_means = good_residuals.float().mean(dim=0)
+            bad_means = bad_residuals.float().mean(dim=0)
             del bad_residuals, good_residuals
         else:
             print("* Obtaining residual mean for good prompts...")

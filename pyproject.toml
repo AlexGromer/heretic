@@ -45,6 +45,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # pytest runs the unittest classes as well as the plain test functions of the fork's
+    # tests, which `unittest discover` cannot collect.
+    "pytest>=8.3",
     "ruff>=0.16.9",
     "ty>=0.0.84",
 ]

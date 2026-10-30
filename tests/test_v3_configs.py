@@ -106,6 +106,7 @@ class ExampleConfigTests(unittest.TestCase):
                 "direction_estimator",
                 "whitening_shrinkage",
                 "extra_direction_source",
+                "paired_residuals_dtype",
                 "pairing",
                 "tokens",
                 "top_k",

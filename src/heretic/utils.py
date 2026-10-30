@@ -12,11 +12,12 @@ import re
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import huggingface_hub
 import tomli_w
@@ -168,39 +169,48 @@ def ensure_interactive(
     )
 
 
+def _question_of(question: Question | Callable[[], Question]) -> Question:
+    # `Question` itself is not callable, so this is the factory case.
+    return cast("Question", question() if callable(question) else question)
+
+
 def ask_if_unset(
     value: T,
-    question: Question,
+    question: Question | Callable[[], Question],
     unsafe: bool = False,
     setting: str | None = None,
 ) -> T:
+    """
+    The given value, or the answer to the question when it is None.
+
+    `question` may be a callable that builds the question (fork addition). Building one
+    creates a prompt_toolkit application, which needs a usable console: with a value in
+    hand, or without a terminal, a lazily built question is never constructed, so a
+    fully configured run works where no console exists at all.
+    """
     if value is None:
-        ensure_interactive(_question_text(question), setting)
+        # Checked before the question is built: without a console, building it fails.
+        ensure_interactive("a question", setting)
+        built = _question_of(question)
         if unsafe:
-            return question.unsafe_ask()
+            return built.unsafe_ask()
         else:
-            return question.ask()
+            return built.ask()
     else:
         return value
 
 
-def ask(question: Question, unsafe: bool = False, hint: str | None = None) -> Any:
+def ask(
+    question: Question | Callable[[], Question],
+    unsafe: bool = False,
+    hint: str | None = None,
+) -> Any:
     """Asks a question that has no setting to answer it in advance."""
-    ensure_interactive(_question_text(question), hint=hint)
+    ensure_interactive("a question", hint=hint)
+    built = _question_of(question)
     if unsafe:
-        return question.unsafe_ask()
-    return question.ask()
-
-
-def _question_text(question: Question) -> str:
-    # questionary keeps the message in the prompt_toolkit application's layout,
-    # which is not part of its public API; fall back to a generic text.
-    try:
-        fragments = question.application.layout.container.content.text()  # ty: ignore[unresolved-attribute]
-        text = "".join(fragment[1] for fragment in fragments).strip()
-        return text.removeprefix("?").strip() or "a question"
-    except Exception:
-        return "a question"
+        return built.unsafe_ask()
+    return built.ask()
 
 
 def get_cot_prefix_extension(responses: list[str]) -> str:

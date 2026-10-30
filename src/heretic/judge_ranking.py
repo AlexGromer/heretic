@@ -86,6 +86,34 @@ def select_candidates(
     return candidates
 
 
+def category_rates(
+    result: JudgeResult, prompts: Sequence["RankingPrompt"]
+) -> dict[str, list[int]]:
+    """Per prompt category: [not answered, total]. Categories are the ranking prompts'."""
+    rates: dict[str, list[int]] = {}
+    for ranking_prompt, label in zip(prompts, result.labels):
+        category = ranking_prompt.category or ""
+        if not category:
+            continue
+        entry = rates.setdefault(category, [0, 0])
+        entry[0] += int(label in result.refusal_labels)
+        entry[1] += 1
+    return rates
+
+
+def format_categories(rates: dict[str, list[int]], worst: int = 3) -> str:
+    """The categories with the highest share of non-answers, worst first."""
+    if not rates:
+        return ""
+    ranked = sorted(
+        rates.items(), key=lambda item: (-item[1][0] / max(item[1][1], 1), item[0])
+    )
+    shown = ", ".join(
+        f"{category} {count}/{total}" for category, (count, total) in ranked[:worst]
+    )
+    return f"worst categories: {shown}"
+
+
 def result_record(
     result: JudgeResult, prompt_version: str, truncated: list[bool]
 ) -> dict[str, Any]:
@@ -480,6 +508,7 @@ def judge_trials(
             for response in responses
         ]
         stored[key] = result_record(result, version, truncated)
+        stored[key]["categories"] = category_rates(result, ranking_prompts)
         study.set_user_attr(JUDGE_SCORES_ATTR, stored)
         if settings.responses_file is not None:
             append_responses(
@@ -492,9 +521,10 @@ def judge_trials(
                 result,
                 version,
             )
+        categories = format_categories(stored[key]["categories"])
         print(
             f"* {title}: [bold]{format_judge_record(stored[key], judge_settings.labels)}[/] "
-            "not answered"
+            "not answered" + (f"; {categories}" if categories else "")
         )
 
     # Leave the model as the menu expects it: the next selection resets it anyway.

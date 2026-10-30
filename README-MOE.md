@@ -577,3 +577,36 @@ uses the row after it.
 
 Tests: `tests/test_v8.py`. Not run on a GPU or on a real model: whether a whitened direction or
 index pairing lowers refusals or KL is unmeasured.
+
+# v9: the checks themselves
+
+Branch `polish`. Housekeeping that makes the other versions trustworthy, plus two small
+diagnostics.
+
+* **CI runs pytest.** Some of this fork's tests are plain test functions, which
+  `unittest discover` cannot collect, so until now they ran only locally: eight of them were
+  invisible to CI. The workflow runs `pytest -q tests/` instead, which also runs every unittest
+  class, and `pytest` is a dev dependency.
+* **Questions are built lazily.** `ask_if_unset` and `ask` accept a callable that builds the
+  question, and every menu in `main.py` / `reproduce.py` passes one. Building a question creates a
+  prompt_toolkit application, which needs a usable console, so a fully configured run (every answer
+  given as a setting) no longer constructs any. That also fixes the only test that failed on
+  Windows for the whole series (`test_adapter_export_is_refused`), which had nothing to do with
+  export strategies: the question was built as an argument before `ask_if_unset` could see the
+  value. A test now pins that no question is built eagerly.
+* **Pair diagnostics at the token level.** The paired estimators and ARA's index pairing print how
+  many pairs share a language and how many share the LAST TOKEN OF THE INSTRUCTION. The hidden
+  state the directions are read from sits at the end of the rendered prompt, whose final tokens
+  come from the chat template and are identical for every prompt, so what differs there is the
+  instruction's own last token. This is feedback for whoever builds the prompt sets.
+* **Memory of the paired estimators.** The estimate (both sets of per-prompt residuals) is printed
+  before they are computed, and `paired_residuals_dtype = "float16"` halves it. Whitening is
+  sensitive to that precision (see the setting's description), so the default stays float32.
+* **Per-category non-answers.** The judge ranking stores the share of non-answers per prompt
+  category (the categories of the ranking prompts) and prints the worst three next to each trial,
+  so a single domain dragging the rate down is visible without opening the files.
+* **`tools/make_fork_patch.sh`** builds the `src/` patch that turns an upstream checkout into this
+  fork and prints its provenance (fork commit, upstream base, file count, sha256), which is what a
+  runner needs to vendor it. Only `src/` travels: configs and tests stay here.
+
+Tests: `tests/test_v9.py`.

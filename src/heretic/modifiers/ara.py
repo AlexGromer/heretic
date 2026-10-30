@@ -28,9 +28,15 @@ from torch.optim import LBFGS
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.model import Model
 from heretic.modifier import Context, Modifier, Serializable
-from heretic.positions import append_module_io, load_answer_items, module_io_means
+from heretic.positions import (
+    append_module_io,
+    format_pair_diagnostics,
+    load_answer_items,
+    module_io_means,
+    pair_diagnostics,
+)
 from heretic.ranges import check_range, scaled_floor
-from heretic.utils import detect_lang, format_dataset_specification, print
+from heretic.utils import format_dataset_specification, print
 
 
 class Pairing(str, Enum):
@@ -408,14 +414,12 @@ class ARA(Modifier[Parameters]):
                     f"{len(bad_prompts)} bad and {len(good_prompts)} good prompts. Use paired "
                     'sets (the harness paired training set and train/good_train) or pairing = "knn".'
                 )
-            languages = sum(
-                detect_lang(bad.user) == detect_lang(good.user)
-                for bad, good in zip(bad_prompts, good_prompts)
-            )
             print()
             print(
-                f"* Index pairing: [bold]{len(bad_prompts)}[/] pairs, "
-                f"[bold]{languages}[/] of them with the same language on both sides"
+                "* Index pairing: "
+                + format_pair_diagnostics(
+                    pair_diagnostics(model, bad_prompts, good_prompts)
+                )
             )
 
         fused_experts_warning = get_fused_experts_warning(model)
