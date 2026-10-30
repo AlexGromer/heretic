@@ -79,6 +79,13 @@ chain_of_thought_blocks = [
 # Whether to print additional information that can help with debugging.
 print_debug_information = false
 
+# Path of a JSON Lines file that every KeywordRate evaluation appends its prompt/response
+# pairs to (fork addition), for reading the counted refusals of a trial by hand.
+# Each line: evaluation number of that scorer (0 = baseline, then one per evaluation
+# in this process), score name, system prompt, prompt, response, and whether it matched.
+# Not stored in the study checkpoint or in uploaded configurations.
+# responses_file = "responses.jsonl"
+
 # List of scorer plugin configs. Each entry is an object
 # { plugin = <plugin>, optimization = <optimization>, instance_name = <optional> }.
 # <optimization> is one of "minimize", "maximize", or "none" (do not optimize).
@@ -163,6 +170,9 @@ column = "text"
 # a subset of the lines using slice notation (e.g. "[:400]").
 # "config" specifies a dataset's specific config/subset name (e.g. "english", "hindi").
 # Leave unset for datasets with a single configuration.
+# "sample_size" (fork addition) draws that many prompts at random from the selected split,
+# reproducibly for a given "sample_seed" (default 0), keeping their order. Useful for
+# datasets sorted by category such as OR-Bench (see config.orbench.toml).
 
 [scorer.KeywordRate]
 # Name that describes what the configured keyword rate measures.
@@ -316,6 +326,20 @@ history_size = 10
 
 # Whether to print the loss value for each L-BFGS optimization step.
 print_loss = false
+
+# Weight of a ridge penalty that keeps the whole matrix close to the original (fork addition,
+# upstream issue #522). The loss only sees the subspace spanned by the recorded inputs, so
+# without it the optimizer may change the matrix in the other directions, which affects the
+# model but not the loss. The penalty is the mean squared output change the edit would cause on
+# inputs of the recorded inputs' mean norm in random directions, so it has the units of the term
+# that preserves the outputs for good prompts. 0 disables it (upstream behavior). Not measured on
+# real models yet; try values around 0.1 to 1 and compare KL divergence.
+ridge_weight = 0.0
+
+# Line search of the L-BFGS optimizer: "strong_wolfe" (upstream) or "none" (fixed steps of
+# learning_rate, which avoids the arbitrarily long steps described in issue #522, but can diverge;
+# a module whose adapter becomes non-finite is then left unmodified).
+line_search = "strong_wolfe"
 
 # Search ranges of the optimizer. The defaults are the fixed ranges of upstream Heretic;
 # widen them to explore stronger steering (see config.wide.toml). Each range is [low, high].

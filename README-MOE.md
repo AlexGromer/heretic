@@ -190,3 +190,75 @@ numbers are the authors' own and not comparable with ours):
 This implementation follows the method description in the task specification and the fork's own
 code. No code of these projects was copied, so none of it is derived work; the credit is for the idea.
 Router pre-bias (heretic issue #322) is not implemented.
+
+# v4: OR-Bench-hard as a second bad_eval, upstream issue fixes
+
+Branch `moe-fused-v4`, on top of `moe-fused-v3` (`15c1048`). Every addition is off by default or
+behaves like v3 unless configured. Tests: `tests/test_v4.py` (CPU; the ARA tests use the tiny MoE
+model). Nothing here was run on a GPU or on the real Qwen3 / Devstral models.
+
+## 1. OR-Bench-hard as a second refusal evaluation set
+
+Follow-up item 2 of the research report: "OR-Bench-hard as a second bad_eval for Optuna, only if
+the first cycle shows that the keyword scorer overfits our bad_eval". Every trial is picked by its
+refusal count on the same 100 prompts (`mlabonne/harmful_behaviors` `test[:100]`), so the Pareto
+front can reward edits that remove refusals on exactly those prompts. `config.orbench.toml` adds
+a second `KeywordRate` instance (`orbench`, shown as `Refusals - orbench`) on 100 prompts of
+[OR-Bench-hard-1K](https://huggingface.co/datasets/bench-llm/or-bench) (`or-bench-hard-1k`,
+CC-BY-4.0, 1319 seemingly harmful prompts that many models refuse; not used for training).
+
+* **Sampling.** OR-Bench is sorted by category; `train[:100]` covers only `deception` and
+  `harassment`. Dataset specifications take `sample_size` and `sample_seed` now: a reproducible
+  random draw from the selected split (order kept). Works for HF datasets, local datasets and
+  text files.
+* **Cycle 1.** The instance runs with `optimization = "none"`: it is evaluated and shown on every
+  trial but does not steer the search. Afterwards
+  `heretic-generalization checkpoints/<model>.jsonl` reads the study checkpoint and compares, over
+  the Pareto trials with KL <= 0.15, the removed fraction of baseline refusals on the evaluation
+  prompts with the removed fraction on OR-Bench. It reports overfitting (exit code 1) when the
+  median gap exceeds 0.2, or when the Spearman correlation of the two refusal rates over all trials
+  is below 0.5 (thresholds are options). It warns when the OR-Bench baseline is below 0.1 (then
+  the set hardly triggers refusals on that model and says little).
+* **Cycle 2, only if overfitting is reported.** Set the instance to `optimization = "minimize"`
+  and use a new `study_checkpoint_dir`: a study cannot change its number of objectives, and
+  "Continue the previous run" restores the settings stored in the old checkpoint. Alternative with
+  two objectives: list both datasets under `[scorer.KeywordRate.prompts]`.
+* `or-bench-toxic` (655 truly harmful prompts) can serve as a held-out set of the same kind as
+  the evaluation prompts (`config = "or-bench-toxic"`).
+
+The thresholds are judgement calls, not calibrated on real runs.
+
+## 2. Responses file (audit of counted refusals, upstream #122)
+
+`responses_file = "responses.jsonl"` (top-level setting): every `KeywordRate` evaluation appends
+one JSON line per prompt (evaluation number of that scorer, 0 = baseline; score name; system
+prompt; prompt; response; match). This is what the research report's first step needs: read the
+"refusals" of the 3/100 and 4/100 trials by hand and label false positives (also the dataset
+upstream asks for in #290). The path is `exclude=True`, so it is not stored in the checkpoint or
+in uploaded configs.
+
+## 3. Fixes for open upstream issues
+
+* **#487** (Qwen3 and other self-thinking models): the "Rechecking with prefix" step appended the
+  common beginning of the reasoning (`\nOkay,`) to the response prefix, keeping the model in CoT
+  mode while it writes the "answer". Only the leading whitespace of the common prefix extends the
+  prefix now; the rest is reported as ignored. Same idea as upstream PR #501 (own code).
+* **#535** (crash without a terminal after the optimization): every question first checks that
+  standard input is a terminal. If not, Heretic stops with a message naming the flag that answers
+  it (`--trial-index`, `--model-action`, `--save-directory`, ...) and lists the Pareto trials with
+  their `--trial-index` values; the checkpoint keeps the results. Exit code 1, no traceback.
+* **#533** (GGUF repositories): a model whose repository or folder only holds `.gguf` files is
+  rejected before loading with a message to use the original repository, instead of a tokenizer
+  traceback. If the file list cannot be fetched (offline), loading proceeds as before.
+* **#522** ("a deep, subtle flaw in ARA"): two `[modifier.ARA]` options, defaults unchanged.
+  `ridge_weight` adds a penalty that keeps the whole matrix close to the original, including the
+  directions that the 400+400 recorded inputs do not span (maintainer's option 1). The penalty is
+  `||B A||_F^2 * E[||x||^2] / (in * out)`, the mean squared output change on inputs of the
+  recorded mean norm in random directions, i.e. in the units of the "preserve good" term, so that
+  one weight transfers across models better than a raw Frobenius weight (not measured; try
+  0.1 to 1). `line_search = "none"` is the maintainer's option 2; a module whose adapter diverges
+  (non-finite adapter or loss) is left unmodified instead of breaking the model.
+
+Not addressed: #490 (live LoRA vs merged scores; upstream PR #495 re-scores the top trials on
+merged models), router pre-bias (#322), SOMA (#140); #436 (tencent/Hy3-FP8) may load with the FP8
+dequantization of v2 but was not tried.

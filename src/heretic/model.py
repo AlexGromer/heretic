@@ -5,8 +5,10 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TypeAlias, cast
 
+import huggingface_hub
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
@@ -32,7 +34,7 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, Settings
 from .system import empty_cache
-from .utils import Prompt, batchify, format_exception, print
+from .utils import HereticUserError, Prompt, batchify, format_exception, print
 
 
 def get_model_class(
@@ -44,6 +46,58 @@ def get_model_class(
         return AutoModelForImageTextToText
     else:
         return AutoModelForCausalLM
+
+
+# Files that hold the weights of a model in a format Transformers loads directly.
+WEIGHT_FILE_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".msgpack",
+    ".h5",
+)
+
+
+def list_model_files(model: str, **revision_kwargs: Any) -> list[str] | None:
+    """
+    The file names of a local model (a file or a directory) or of a Hugging Face
+    repository, or None if they cannot be listed (e.g. offline).
+    """
+    path = Path(model)
+    if path.is_file():
+        return [path.name]
+    if path.is_dir():
+        return [
+            str(file.relative_to(path)) for file in path.rglob("*") if file.is_file()
+        ]
+
+    try:
+        return huggingface_hub.list_repo_files(model, **revision_kwargs)
+    except Exception:
+        return None
+
+
+def check_not_gguf_only(model: str, files: list[str] | None) -> None:
+    """
+    Rejects models that only exist as GGUF files (#533). Transformers would try to
+    load them as a regular checkpoint and fail with an unrelated tokenizer error.
+    """
+    if not files:
+        return
+
+    names = [name.lower() for name in files]
+    has_gguf = any(name.endswith(".gguf") for name in names)
+    has_weights = any(name.endswith(WEIGHT_FILE_SUFFIXES) for name in names)
+
+    if has_gguf and not has_weights:
+        raise HereticUserError(
+            f"{model} contains only GGUF files. Heretic loads models in the Transformers "
+            "format (safetensors) and cannot modify GGUF files. Use the original model "
+            "repository the GGUF files were made from, and convert the result to GGUF "
+            "afterwards (e.g. with llama.cpp's convert_hf_to_gguf.py)."
+        )
 
 
 def get_fp8_quantization_config(
@@ -240,6 +294,11 @@ class Model:
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
+
+        check_not_gguf_only(
+            settings.model,
+            list_model_files(settings.model, **self.revision_kwargs),
+        )
 
         # PreTrainedTokenizerBase is the "base class for all tokenizer backends"
         # according to the documentation.

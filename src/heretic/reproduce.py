@@ -379,6 +379,7 @@ def check_environment(
                 ],
                 style=Style([("highlighted", "reverse")]),
             ),
+            setting="ignore_mismatches",
         )
     else:
         # There are no mismatches at all, so there is nothing to confirm.

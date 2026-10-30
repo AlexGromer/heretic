@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import platform
+import random
+import sys
 import tempfile
 import traceback
 from dataclasses import dataclass
@@ -124,14 +126,95 @@ def format_exception(error: Exception) -> str:
     return traceback.format_exc().strip()
 
 
-def ask_if_unset(value: T, question: Question, unsafe: bool = False) -> T:
+class HereticUserError(Exception):
+    """
+    An error caused by the input (configuration, model, environment) rather than
+    by a bug. `main` prints its message without a traceback and exits with code 1.
+    """
+
+
+def is_interactive() -> bool:
+    """Whether questions can be asked, i.e. standard input is a terminal."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def ensure_interactive(
+    question: str,
+    setting: str | None = None,
+    hint: str | None = None,
+) -> None:
+    """
+    Raises a HereticUserError naming the setting to pass instead if a question
+    would have to be asked without a terminal (#535). Without this check,
+    prompt_toolkit fails with an EOFError after the optimization has finished.
+    """
+    if is_interactive():
+        return
+
+    if hint is None:
+        hint = (
+            f"Pass it with --{setting.replace('_', '-')} (or set {setting} in config.toml)."
+            if setting
+            else "Run Heretic in a terminal for this step."
+        )
+    raise HereticUserError(
+        f"Heretic needs an answer to {question!r}, but standard input is not a terminal. {hint} "
+        "The results of the optimization are kept in the study checkpoint, so the run can be "
+        "resumed with the missing settings."
+    )
+
+
+def ask_if_unset(
+    value: T,
+    question: Question,
+    unsafe: bool = False,
+    setting: str | None = None,
+) -> T:
     if value is None:
+        ensure_interactive(_question_text(question), setting)
         if unsafe:
             return question.unsafe_ask()
         else:
             return question.ask()
     else:
         return value
+
+
+def ask(question: Question, unsafe: bool = False, hint: str | None = None) -> Any:
+    """Asks a question that has no setting to answer it in advance."""
+    ensure_interactive(_question_text(question), hint=hint)
+    if unsafe:
+        return question.unsafe_ask()
+    return question.ask()
+
+
+def _question_text(question: Question) -> str:
+    # questionary keeps the message in the prompt_toolkit application's layout,
+    # which is not part of its public API; fall back to a generic text.
+    try:
+        fragments = question.application.layout.container.content.text()  # ty: ignore[unresolved-attribute]
+        text = "".join(fragment[1] for fragment in fragments).strip()
+        return text.removeprefix("?").strip() or "a question"
+    except Exception:
+        return "a question"
+
+
+def get_cot_prefix_extension(responses: list[str]) -> str:
+    """
+    The part of the common prefix of `responses` (generated with a closed
+    Chain-of-Thought block as the response prefix) that may extend that prefix:
+    its leading whitespace (e.g. a missing trailing newline after the block).
+
+    Anything after it is the beginning of the model's own text. For models that
+    generate their own Chain-of-Thought (e.g. Qwen3), that is reasoning that starts
+    near-identically for every prompt, and must not become part of the prefix (#487).
+    """
+    common_prefix = os.path.commonprefix(responses)
+    whitespace = common_prefix[: len(common_prefix) - len(common_prefix.lstrip())]
+    return whitespace.rstrip(" ")
 
 
 def is_hf_path(path: str) -> bool:
@@ -167,6 +250,25 @@ def get_split_slice(split_str: str, length: int) -> tuple[int, int]:
     )[0]
 
     return absolute_instruction.from_, absolute_instruction.to
+
+
+def sample_prompts(
+    prompts: list[str],
+    sample_size: int,
+    seed: int,
+    source: str = "dataset",
+) -> list[str]:
+    """
+    Draws `sample_size` prompts at random, reproducibly for a given seed.
+    The drawn prompts keep their order in the source.
+    """
+    if sample_size > len(prompts):
+        raise ValueError(
+            f"sample_size {sample_size} is larger than the {len(prompts)} prompts selected from {source}"
+        )
+
+    indices = sorted(random.Random(seed).sample(range(len(prompts)), sample_size))
+    return [prompts[index] for index in indices]
 
 
 def _load_prompts_single(
@@ -239,6 +341,14 @@ def _load_prompts_single(
             )
 
         prompts = list(dataset[specification.column])
+
+    if specification.sample_size is not None:
+        prompts = sample_prompts(
+            prompts,
+            specification.sample_size,
+            specification.sample_seed,
+            path,
+        )
 
     if specification.prefix:
         prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]

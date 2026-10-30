@@ -6,7 +6,7 @@
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import bitsandbytes.functional as BNB_F
 import torch
@@ -16,6 +16,7 @@ from peft.tuners.lora.layer import Linear
 from pydantic import (
     BaseModel,
     Field,
+    NonNegativeFloat,
     PositiveInt,
     ValidationInfo,
     field_validator,
@@ -116,6 +117,30 @@ class Settings(BaseModel):
         description="Whether to print the loss value for each L-BFGS optimization step.",
     )
 
+    # Fork additions for upstream issue #522: the loss only sees the subspace spanned by the
+    # recorded inputs, so the optimizer can change the matrix freely outside of it, and the
+    # line search can amplify such changes. They do not affect the loss but do affect the model.
+    ridge_weight: NonNegativeFloat = Field(
+        default=0.0,
+        description=(
+            "Weight of a ridge penalty that keeps the whole matrix close to the original, "
+            "including the directions the recorded inputs do not cover (upstream issue #522). "
+            "The penalty is the mean squared output change the edit would cause on inputs of "
+            "the recorded inputs' mean norm pointing in random directions, i.e. it has the units "
+            "of the term that preserves the outputs for good prompts. 0 disables it (upstream behavior)."
+        ),
+    )
+
+    line_search: Literal["strong_wolfe", "none"] = Field(
+        default="strong_wolfe",
+        description=(
+            'Line search of the L-BFGS optimizer. "none" uses fixed steps of learning_rate, '
+            "which avoids the arbitrarily long steps that can blow up changes outside the "
+            "recorded subspace (upstream issue #522), but can diverge; a module whose adapter "
+            "becomes non-finite is left unmodified."
+        ),
+    )
+
     # Search ranges (fork addition). The defaults are the fixed ranges of upstream Heretic;
     # widen them to let the optimizer explore stronger steering.
     start_layer_range: tuple[float, float] = Field(
@@ -196,6 +221,14 @@ def mean_distances_to_knn(a: Tensor, b: Tensor, k: int) -> Tensor:
     distances = torch.cdist(a, b)
     nearest_distances, _ = distances.topk(k, dim=1, largest=False)
     return nearest_distances.mean(1)
+
+
+def lowrank_frobenius_sq(A: Tensor, B: Tensor) -> Tensor:
+    """
+    ||B @ A||_F^2 = trace((B^T B) (A A^T)), computed from two rank x rank matrices
+    instead of the dense out_features x in_features product.
+    """
+    return ((B.T @ B) * (A @ A.T)).sum()
 
 
 # The objective function at the heart of ARA.
@@ -465,6 +498,22 @@ class ARA(Modifier[Parameters]):
                     if bias is not None:
                         bias = bias.detach().float().to(lora_A.device)
 
+                    # For the ridge penalty: inputs x with E[||x||^2] = input_norm_sq in
+                    # uniformly random directions change the outputs of W by (B @ A) @ x,
+                    # with E[||(B @ A) @ x||^2] = ||B @ A||_F^2 * input_norm_sq / in_features.
+                    # Dividing by out_features gives the mean over output components,
+                    # matching the mean in the preserve term of ara_loss.
+                    ridge_scale = 0.0
+                    if self.settings.ridge_weight > 0:
+                        input_norm_sq = (
+                            torch.cat([good_input, bad_input]).pow(2).sum(dim=1).mean()
+                        )
+                        ridge_scale = (
+                            self.settings.ridge_weight
+                            * input_norm_sq.item()
+                            / (W_base.shape[0] * W_base.shape[1])
+                        )
+
                     def objective(A: Tensor, B: Tensor) -> Tensor:
                         # input @ (W_base + B @ A).T
                         #   = input @ W_base.T + (input @ A.T) @ B.T
@@ -488,7 +537,7 @@ class ARA(Modifier[Parameters]):
                             new_good_output = new_good_output + bias
                             new_bad_output = new_bad_output + bias
 
-                        return ara_loss(
+                        loss = ara_loss(
                             good_output,
                             bad_output,
                             new_good_output,
@@ -496,12 +545,19 @@ class ARA(Modifier[Parameters]):
                             parameters,
                         )
 
+                        if ridge_scale > 0:
+                            loss = loss + ridge_scale * lowrank_frobenius_sq(A, B)
+
+                        return loss
+
                     optimizer = LBFGS(
                         [lora_A, lora_B],
                         lr=self.settings.learning_rate,
                         max_iter=self.settings.max_iter,
                         history_size=self.settings.history_size,
-                        line_search_fn="strong_wolfe",
+                        line_search_fn=None
+                        if self.settings.line_search == "none"
+                        else self.settings.line_search,
                     )
 
                     def closure() -> Tensor:
@@ -516,6 +572,24 @@ class ARA(Modifier[Parameters]):
                             print(
                                 f"\\[{layer_index}/{component}/{module_index}] Step: {step + 1}, Loss: {loss.item():.6f}"
                             )
+
+                    # Without a line search, the optimizer can diverge to adapters that are
+                    # non-finite or so large that the loss is. Such a module is left
+                    # unmodified instead of breaking the model.
+                    with torch.no_grad():
+                        diverged = not (
+                            torch.isfinite(lora_A).all()
+                            and torch.isfinite(lora_B).all()
+                            and torch.isfinite(objective(lora_A, lora_B))
+                        )
+                    if diverged:
+                        with torch.no_grad():
+                            lora_A.zero_()
+                            lora_B.zero_()
+                        print(
+                            f"[yellow]ARA diverged for {component} in layer {layer_index}; "
+                            "that module is left unmodified.[/]"
+                        )
 
                     # Free the gradient buffers accumulated during optimization.
                     # Without this, they persist on the model (one full-size gradient

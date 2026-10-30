@@ -97,14 +97,18 @@ from .reproduce import (
 )
 from .system import empty_cache, get_accelerator_info
 from .utils import (
+    HereticUserError,
+    ask,
     ask_if_unset,
     format_dataset_specification,
     format_duration,
     format_exception,
+    get_cot_prefix_extension,
     get_file_sha256,
     get_readme_intro,
     is_dataset_specification_reproducible,
     is_hf_path,
+    is_interactive,
     load_prompts,
     print,
     print_memory_usage,
@@ -210,6 +214,7 @@ def obtain_export_strategy(
             ],
             style=Style([("highlighted", "reverse")]),
         ),
+        setting="export_strategy",
     )
 
 
@@ -417,6 +422,7 @@ def run():
                 choices=choices,
                 style=Style([("highlighted", "reverse")]),
             ),
+            setting="checkpoint_action",
         )
 
         if action is None or action == "":
@@ -643,11 +649,21 @@ def run():
             # is actually complete (e.g. not missing a trailing newline).
             print("* Rechecking with prefix...")
             responses = model.get_responses_batched(response_prefix_test_prompts)
-            additional_prefix = commonprefix(responses).rstrip(" ")
+            common_prefix = commonprefix(responses).rstrip(" ")
+            additional_prefix = get_cot_prefix_extension(responses)
             if additional_prefix:
                 settings.response_prefix += additional_prefix
                 print(
                     f"* Extended prefix found: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
+            if common_prefix.strip():
+                # Models that generate their own CoT (e.g. Qwen3) start their reasoning
+                # near-identically for every prompt ("Okay, ..."), so the common prefix
+                # reaches into the reasoning text. Appending it would keep the model in
+                # CoT mode while writing what Heretic treats as the final answer (#487).
+                print(
+                    f"* Ignoring non-whitespace common prefix [bold]{escape(repr(common_prefix[len(additional_prefix) :]))}[/] "
+                    "to avoid keeping the model in Chain-of-Thought mode"
                 )
 
     evaluator = Evaluator(settings, model)
@@ -854,6 +870,15 @@ def run():
                     "You can return to this menu later to select a different trial. "
                 )
 
+                if not is_interactive():
+                    # Without a terminal, the menu cannot be shown (#535), so list the
+                    # values that --trial-index accepts.
+                    print()
+                    for index, sorted_trial in enumerate(sorted_trials):
+                        print(
+                            f"* --trial-index {index}: {escape(format_trial_title(sorted_trial))}"
+                        )
+
         while trial_loop_active:
             # Ensure a predefined trial is only processed once.
             if settings.trial_index is not None:
@@ -883,6 +908,7 @@ def run():
                         choices=choices,
                         style=Style([("highlighted", "reverse")]),
                     ),
+                    setting="trial_index",
                 )
 
                 if trial is None or trial == "":
@@ -896,6 +922,7 @@ def run():
                                 questionary.text(
                                     "How many additional trials do you want to run?"
                                 ),
+                                setting="n_additional_trials",
                             )
                             if n_additional_trials is None or n_additional_trials == "":
                                 n_additional_trials = 0
@@ -991,6 +1018,7 @@ def run():
                         ],
                         style=Style([("highlighted", "reverse")]),
                     ),
+                    setting="model_action",
                 )
 
                 if action is None or action == "":
@@ -1011,6 +1039,7 @@ def run():
                                     "Path to the folder:",
                                     only_directories=True,
                                 ),
+                                setting="save_directory",
                             )
                             if not save_directory:
                                 continue
@@ -1079,9 +1108,10 @@ def run():
                                 #       precaution to prevent exporting the token under all circumstances.
                                 #       For scripting, the correct way to set the token is through the HF_TOKEN
                                 #       environment variable, or through the HF token file.
-                                token = questionary.password(
-                                    "Hugging Face access token:"
-                                ).ask()
+                                token = ask(
+                                    questionary.password("Hugging Face access token:"),
+                                    hint="Set the HF_TOKEN environment variable.",
+                                )
                             if not token:
                                 continue
 
@@ -1099,6 +1129,7 @@ def run():
                                     "Name of repository:",
                                     default=f"{user['name']}/{Path(settings.model).name}-heretic",
                                 ),
+                                setting="upload_repo_id",
                             )
                             if not repo_id:
                                 continue
@@ -1119,6 +1150,7 @@ def run():
                                     ],
                                     style=Style([("highlighted", "reverse")]),
                                 ),
+                                setting="upload_repo_private",
                             )
                             if visibility is None:
                                 continue
@@ -1181,6 +1213,7 @@ def run():
                                         ],
                                         style=Style([("highlighted", "reverse")]),
                                     ),
+                                    setting="upload_reproducibility_information",
                                 )
                                 if reproducibility_information is None:
                                     continue
@@ -1352,10 +1385,13 @@ def run():
 
                             while True:
                                 try:
-                                    message = questionary.text(
-                                        "User:",
-                                        qmark=">",
-                                    ).unsafe_ask()
+                                    message = ask(
+                                        questionary.text(
+                                            "User:",
+                                            qmark=">",
+                                        ),
+                                        unsafe=True,
+                                    )
                                     if not message:
                                         break
                                     chat.append({"role": "user", "content": message})
@@ -1370,31 +1406,35 @@ def run():
                                     break
 
                         case "benchmark":
-                            benchmarks = questionary.checkbox(
-                                "Which benchmarks do you want to run?",
-                                [
-                                    Choice(
-                                        title=f"{benchmark.name}: {benchmark.description}",
-                                        value=benchmark,
-                                    )
-                                    for benchmark in settings.benchmarks
-                                ],
-                                style=Style([("highlighted", "reverse")]),
-                            ).ask()
+                            benchmarks = ask(
+                                questionary.checkbox(
+                                    "Which benchmarks do you want to run?",
+                                    [
+                                        Choice(
+                                            title=f"{benchmark.name}: {benchmark.description}",
+                                            value=benchmark,
+                                        )
+                                        for benchmark in settings.benchmarks
+                                    ],
+                                    style=Style([("highlighted", "reverse")]),
+                                )
+                            )
                             if not benchmarks:
                                 continue
 
-                            scope = questionary.select(
-                                (
-                                    "Do you want to benchmark the original model along with the decensored model? "
-                                    "Benchmarking both models allows you to compare the scores, but it takes twice as much time."
-                                ),
-                                choices=[
-                                    "Benchmark only the decensored model",
-                                    "Benchmark both models",
-                                ],
-                                style=Style([("highlighted", "reverse")]),
-                            ).ask()
+                            scope = ask(
+                                questionary.select(
+                                    (
+                                        "Do you want to benchmark the original model along with the decensored model? "
+                                        "Benchmarking both models allows you to compare the scores, but it takes twice as much time."
+                                    ),
+                                    choices=[
+                                        "Benchmark only the decensored model",
+                                        "Benchmark both models",
+                                    ],
+                                    style=Style([("highlighted", "reverse")]),
+                                )
+                            )
                             if scope is None:
                                 continue
                             benchmark_original_model = scope == "Benchmark both models"
@@ -1478,6 +1518,8 @@ def run():
                             if table.rows:
                                 print(table)
 
+                except HereticUserError:
+                    raise
                 except Exception as error:
                     formatted = format_exception(error)
                     if "\n" in formatted:
@@ -1492,6 +1534,10 @@ def main():
 
     try:
         run()
+    except HereticUserError as error:
+        print()
+        print(f"[red]Error: {escape(str(error))}[/]")
+        sys.exit(1)
     except BaseException as error:
         # Transformers appears to handle KeyboardInterrupt (or BaseException)
         # internally in some places, which can re-raise a different error in the handler,

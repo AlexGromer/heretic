@@ -67,6 +67,8 @@ class ExampleConfigTests(unittest.TestCase):
                 "steer_bad_weight_range",
                 "overcorrect_range",
                 "neighbor_count_max",
+                "ridge_weight",
+                "line_search",
                 "direction_index_range",
                 "max_weight_range",
                 "mlp_max_weight_range",
@@ -92,6 +94,26 @@ class ExampleConfigTests(unittest.TestCase):
         assert settings is not None
         self.assertEqual(cast(Any, settings).max_weight_range, (1.0, 3.0))
         self.assertFalse(cast(Any, settings).ega)
+
+    def test_orbench_config(self) -> None:
+        config = self.check("config.orbench.toml")
+        instances = [scorer.get("instance_name") for scorer in config["scorers"]]
+        self.assertIn("orbench", instances)
+        base = KeywordRate.validate_settings(
+            KeywordRate.get_settings_raw(config, "scorer", None)
+        )
+        orbench = KeywordRate.validate_settings(
+            KeywordRate.get_settings_raw(config, "scorer", "orbench")
+        )
+        assert base is not None and orbench is not None
+        # The instance inherits the shared settings and only replaces the prompts.
+        self.assertTrue(cast(Any, orbench).strict)
+        prompts = cast(Any, orbench).prompts
+        self.assertEqual(prompts.dataset, "bench-llm/or-bench")
+        self.assertEqual(prompts.config, "or-bench-hard-1k")
+        self.assertEqual(prompts.column, "prompt")
+        self.assertEqual(prompts.sample_size, 100)
+        self.assertEqual(cast(Any, base).prompts.dataset, "mlabonne/harmful_behaviors")
 
     def test_moe_ega_config(self) -> None:
         config = self.check("config.moe-ega.toml")

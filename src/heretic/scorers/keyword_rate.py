@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import json
 import re
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, PositiveInt, field_validator
@@ -282,15 +284,27 @@ class KeywordRate(Scorer):
         )
         self.prompts = ctx.load_prompts(self.settings.prompts)
         print(f"* [bold]{len(self.prompts)}[/] prompts loaded")
+        self._evaluation_count = 0
 
     def get_score(self, ctx: Context) -> Score:
         match_count = 0
         responses = ctx.get_responses(self.prompts)
         tokenizer = self._get_tokenizer(ctx) if self.settings.strict else None
+        records: list[dict[str, Any]] = []
         for prompt, response in zip(self.prompts, responses):
             is_match = self._is_match(response, tokenizer)
             if is_match:
                 match_count += 1
+
+            if self.heretic_settings.responses_file is not None:
+                records.append(
+                    {
+                        "system": prompt.system,
+                        "prompt": prompt.user,
+                        "response": response,
+                        "match": is_match,
+                    }
+                )
 
             if self.settings.print_responses:
                 print()
@@ -307,11 +321,31 @@ class KeywordRate(Scorer):
         if self.settings.print_responses:
             print()
 
+        if self.heretic_settings.responses_file is not None:
+            self._write_responses(records)
+
         return Score(
             value=float(match_count / len(self.prompts)),
             rich_display=f"[bold]{match_count}[/]/{len(self.prompts)}",
             md_display=f"{match_count}/{len(self.prompts)}",
         )
+
+    def _write_responses(self, records: list[dict[str, Any]]) -> None:
+        assert self.heretic_settings.responses_file is not None
+        path = Path(self.heretic_settings.responses_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        evaluation = getattr(self, "_evaluation_count", 0)
+        self._evaluation_count = evaluation + 1
+
+        with open(path, "a", encoding="utf-8") as file:
+            for record in records:
+                line = {
+                    "evaluation": evaluation,
+                    "score_name": self.settings.score_name,
+                    **record,
+                }
+                file.write(json.dumps(line, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _get_tokenizer(ctx: Context) -> Any:

@@ -80,6 +80,21 @@ class SingleDatasetSpecification(BaseModel):
         description="System prompt to use with the prompts (overrides global system prompt if set).",
     )
 
+    sample_size: PositiveInt | None = Field(
+        default=None,
+        description=(
+            "Number of prompts to draw at random from the selected split (fork addition). "
+            "Useful for datasets that are sorted by category, such as OR-Bench, where a plain "
+            'slice like "train[:100]" would only cover the first categories. '
+            "Unset uses the whole split."
+        ),
+    )
+
+    sample_seed: int = Field(
+        default=0,
+        description="Seed of the random draw selected by sample_size. The same seed always draws the same prompts.",
+    )
+
 
 DatasetSpecification: TypeAlias = (
     SingleDatasetSpecification | list[SingleDatasetSpecification]
@@ -380,6 +395,17 @@ class Settings(BaseSettings):
     print_debug_information: bool = Field(
         default=False,
         description="Whether to print additional information that can help with debugging.",
+        exclude=True,
+    )
+
+    responses_file: str | None = Field(
+        default=None,
+        description=(
+            "Path of a JSON Lines file that every KeywordRate evaluation appends its prompt/response "
+            "pairs to (fork addition, for auditing the counted matches by hand). Each line holds the "
+            "evaluation number of that scorer (0 = baseline, then one per evaluation in this process), "
+            "the score name, the prompts, the response and whether it counted as a match."
+        ),
         exclude=True,
     )
 
