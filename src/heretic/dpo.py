@@ -216,8 +216,42 @@ def command_judge(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 2
 
 
+def join_refusal_eval(responses_path: str, judged_path: str) -> list[dict[str, Any]]:
+    """
+    refusal-eval responses.jsonl rows with the label of judged.jsonl (joined by row key),
+    in the shape build_pairs reads (prompt, response, judge_label, finish, system).
+    """
+    from .positions import _read_jsonl, _refusal_eval_key
+
+    labels: dict[str, str] = {}
+    for row in _read_jsonl(judged_path):
+        if isinstance(row.get("label"), str):
+            labels.setdefault(_refusal_eval_key(row), row["label"])
+    rows = []
+    for row in _read_jsonl(responses_path):
+        label = labels.get(_refusal_eval_key(row))
+        if label is None:
+            continue
+        settings = row.get("settings")
+        system = settings.get("system_prompt", "") if isinstance(settings, dict) else ""
+        rows.append(
+            {
+                "prompt": row["prompt"],
+                "response": row["response"],
+                "judge_label": label,
+                "finish": row.get("finish"),
+                "system": row.get("system", system),
+            }
+        )
+    return rows
+
+
 def command_pairs(args: argparse.Namespace) -> int:
-    rows = read_jsonl(args.judged)
+    rows = (
+        join_refusal_eval(args.responses, args.judged)
+        if args.responses
+        else read_jsonl(args.judged)
+    )
     pairs = build_pairs(
         rows,
         max_pairs_per_prompt=args.max_pairs_per_prompt,
@@ -329,7 +363,15 @@ def main(argv: list[str] | None = None) -> int:
     judge.add_argument("--rubric", help='e.g. "../refusal-eval/judge.py:SYSTEM_PROMPT"')
 
     pairs = sub.add_parser("pairs", help="build DPO pairs from judged samples")
-    pairs.add_argument("--judged", required=True)
+    pairs.add_argument(
+        "--judged",
+        required=True,
+        help="heretic-dpo-pairs judge output, or refusal-eval judged.jsonl with --responses",
+    )
+    pairs.add_argument(
+        "--responses",
+        help="refusal-eval responses.jsonl (e.g. generate_colab.py --sets bad_train --samples 4)",
+    )
     pairs.add_argument("--out", required=True)
     pairs.add_argument("--max-pairs-per-prompt", type=int, default=2)
     pairs.add_argument("--keep-truncated-chosen", action="store_true")

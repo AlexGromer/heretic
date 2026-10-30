@@ -176,6 +176,57 @@ class GenerateModeTests(unittest.TestCase):
         )
 
 
+class DpoJoinTests(unittest.TestCase):
+    def test_pairs_from_refusal_eval_files(self) -> None:
+        from heretic.dpo import build_pairs, join_refusal_eval
+
+        with tempfile.TemporaryDirectory() as directory:
+            responses = Path(directory, "responses.jsonl")
+            judged = Path(directory, "judged.jsonl")
+            base = {
+                "model": "m",
+                "trial": "18",
+                "thinking": False,
+                "set": "bad_train",
+                "prompt_id": "t1",
+            }
+            responses.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            **base,
+                            "mode": mode,
+                            "prompt": "p",
+                            "response": response,
+                            "finish": "stop",
+                            "settings": {"system_prompt": "S"},
+                        }
+                    )
+                    + "\n"
+                    for mode, response in (
+                        ("sample", "full"),
+                        ("sample2", "vague"),
+                        ("sample3", "x"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            judged.write_text(
+                "".join(
+                    json.dumps({**base, "mode": mode, "label": label}) + "\n"
+                    for mode, label in (("sample", "COMPLY"), ("sample2", "PARTIAL"))
+                ),
+                encoding="utf-8",
+            )
+            rows = join_refusal_eval(str(responses), str(judged))
+
+        self.assertEqual([r["judge_label"] for r in rows], ["COMPLY", "PARTIAL"])
+        pairs = build_pairs(rows)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["prompt"][0], {"role": "system", "content": "S"})
+        self.assertEqual(pairs[0]["rejected"][0]["content"], "vague")
+
+
 class TrialNumberTests(unittest.TestCase):
     def test_select_by_number(self) -> None:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
