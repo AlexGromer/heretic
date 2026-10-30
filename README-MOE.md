@@ -333,26 +333,87 @@ skipped. Not combined with ARA (ARA does not use the Abliteration settings).
 
 ## 4. Local judge
 
-A judge model classifies each answer as `comply`, `soft_refuse` (clarifying questions only,
-lecture, change of topic, deliberately vague), `refuse` or `useless` (empty, incoherent,
-unrelated). It talks to any OpenAI-compatible endpoint, by default a local Ollama
-(`http://localhost:11434/v1`, model `qwen3:8b`; `llama-server` works as well); the prompts are
-sensitive, so keep it local. `HERETIC_JUDGE_API_KEY` is sent as a bearer token if set.
-
-* **Offline, after a run:** `heretic-judge responses.jsonl --evaluation 0 --evaluation 37
-  --output labelled.jsonl` labels a responses file (setting `responses_file`) and prints, per score
-  and evaluation, the keyword count next to the judge count and the label counts, plus how often
-  the two disagree (keyword-only = likely false positives, judge-only = refusals the markers miss).
-  This is the audit step of the research report without hand-labelling everything.
-* **During a run:** scorer `heretic.scorers.judge_rate.JudgeRate` (section `[scorer.JudgeRate]`),
-  intended with `optimization = "none"` next to `KeywordRate`: it judges every trial, which is
-  slow, and is not exactly reproducible (marked as such, so the reproducibility offer is off).
-  Chain-of-thought blocks are removed before judging.
-
-The judge itself is not calibrated. Check it against about 50 hand-labelled answers first.
+Superseded by v6, section 1 (the judge now follows refusal-eval exactly).
 
 ## Not done
 
 Comparing with abliterix on Devstral-Small-2-24B is an experiment, not a code change: it needs
 the BF16 model (about 48 GB) on a large GPU and running both tools on the same prompts with the
 same KL definition. Nothing in the fork blocks it.
+
+# v6: against PARTIAL answers
+
+Same branch `moe-fused-v4`. Measured with the refusal-eval judge (refusal / partial / comply, %):
+Qwen3-8B base 52.1 / 32.3 / 15.7, trial 18 1.4 / 46.5 / 52.1; Qwen3-14B base 47.9 / 27.6 / 24.4,
+trial 90 41.9 / 35.0 / 12.9; Qwen3.8-27B base 89.9 / 6.9 / 3.2, trial 96 8.8 / 55.8 / 35.5.
+Abliteration turns refusals into PARTIAL answers, and the keyword metric cannot see them (on
+Qwen3-14B it picked a trial that kept 42% refusals). Everything below is off by default, tested on
+CPU with tiny models (`tests/test_v6.py`), and not measured on real models.
+
+## 1. The refusal-eval judge in Heretic
+
+`heretic/judge.py` implements the protocol of `refusal-eval/judge.py`, so numbers are comparable:
+the same system prompt (built-in byte-identical copy, prompt version `v1-039fd0fa`; or
+`rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"`, read by parsing the file, not executing it),
+the same user message and clipping, the same CoT stripping, Ollama `/api/chat` with `think: false`,
+the JSON schema, temperature 0, seed 0, 3 retries, and the same parser. Labels REFUSAL, PARTIAL,
+COMPLY, OFF_TOPIC; REFUSAL + PARTIAL count as not answered. Settings in `[scorer.JudgeRate]`
+(endpoint, model, `api = "openai"` for OpenAI-compatible servers, labels, rubric). Used by:
+
+* `heretic-judge responses.jsonl`: labels a `responses_file` and compares with the keyword counts;
+* scorer `JudgeRate` (`optimization = "none"`; judges every trial, slow);
+* **judge re-ranking** (`n_judge_ranking_trials = N`): after the optimization, the original model
+  and the first N trials of the Pareto front with KL <= `judge_ranking_max_kl` generate answers to
+  the `[scorer.JudgeRate]` prompts (`judge_ranking_response_length`, default 512 like refusal-eval)
+  and are judged. The menu lists the judged trials first, by share of non-answers, then by KL, with
+  the label counts and the answers cut at the length limit. Stored in the study per prompt version.
+
+## 2. Distilled classifier as an objective
+
+`heretic-train-classifier --responses R.jsonl --judged J.jsonl --output classifiers/nonanswer`
+fine-tunes ModernBERT-base (as in upstream PR #500) on judged answers (refusal-eval files, joined by
+row key, or heretic-judge output); validation holds out whole prompts and reports Cohen's kappa
+against the judge (4-class and answered / not answered) and warns below 0.75. Scorer
+`heretic.scorers.classifier_rate.ClassifierRate` (`model_path`) then scores 100 answers in seconds,
+so the optimization can minimize REFUSAL + PARTIAL instead of keyword refusals. Use
+`max_response_length` >= 256.
+
+## 3. Directions where the evasion happens
+
+`heretic/positions.py` takes activations at chosen tokens instead of the end of the prompt:
+
+* **Response direction** (`[modifier.Abliteration] response_direction_file`): residuals averaged
+  over the first `response_tokens` tokens of judged answers, PARTIAL minus COMPLY
+  (`response_bad_labels`, `response_good_labels`), as an additional direction
+  `partial_direction` with its own weight.
+* **ARA on answer tokens** (`[modifier.ARA] response_io_file`): the module I/O averaged over the
+  first answer tokens of PARTIAL answers is added to the bad I/O and that of COMPLY answers to the
+  good I/O (the mean is exact for the linear modules ARA edits), so the loss pulls evasive answers
+  towards real ones.
+* **Harmfulness direction** (`harmfulness_direction = true`, Zhao et al. 2025, arXiv 2507.11878):
+  bad minus good prompts at the last token of the user instruction, as `harmfulness_direction`.
+  Experimental.
+
+Additional directions are made orthonormal to the classic one, the good direction and each other,
+and each gets a weight in `direction_weight_range`. Answer files: heretic-judge output (prompt,
+response, judge_label), or refusal-eval `responses.jsonl` plus `judged.jsonl`
+(`*_judged_file`). Use answers to training prompts, not the evaluation hold-out.
+
+## 4. DPO on the model's own answers
+
+`heretic-dpo-pairs generate | judge | pairs | train`: samples answers (default 4 per prompt,
+temperature 0.7), labels them with the same judge, builds pairs (chosen COMPLY, rejected PARTIAL or
+REFUSAL, same prompt; cut-off chosen answers dropped) in TRL's conversational format, and trains a
+DPO LoRA (mlabonne's recipe: r64, alpha 32, lr 5e-6, 1 epoch, beta 0.1; `--merge` saves the merged
+model). `train` needs TRL (`uv pip install trl`, not a Heretic dependency). Whether DPO lowers
+PARTIAL is a hypothesis: measure judge rates, KL and GSM8K.
+
+## 5. Smaller fixes
+
+* KL divergence masks tokens with -inf baseline logits (reserved tokens, e.g. Gemma 4 12B in
+  TrevorS's recipe); without non-finite values it is computed as before.
+* `config.partial.toml`: ARA with judge re-ranking, answer I/O and technical good prompts, plus the
+  second-pass recipe in comments.
+* refusal-eval (branch `partial-diagnostics`): judged rows keep `finish`, the summary counts PARTIAL
+  answers cut at the token limit, `generate_colab.py --system-prompt-file` for an
+  authorized-pentest system prompt.

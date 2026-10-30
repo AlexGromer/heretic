@@ -27,6 +27,7 @@ from torch.optim import LBFGS
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.model import Model
 from heretic.modifier import Context, Modifier, Serializable
+from heretic.positions import append_module_io, load_answer_items, module_io_means
 from heretic.ranges import check_range, scaled_floor
 from heretic.utils import format_dataset_specification, print
 
@@ -115,6 +116,44 @@ class Settings(BaseModel):
     print_loss: bool = Field(
         default=False,
         description="Whether to print the loss value for each L-BFGS optimization step.",
+    )
+
+    # Judged answers whose module I/O is added to the prompt I/O (fork addition, see
+    # heretic/positions.py and the Abliteration settings of the same names).
+    response_io_file: str | None = Field(
+        default=None,
+        description=(
+            "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
+            "heretic-judge; or refusal-eval's responses.jsonl with response_io_judged_file). The "
+            "module I/O averaged over the first response_tokens answer tokens of answers labelled "
+            "response_bad_labels is added to the bad I/O, that of response_good_labels to the "
+            "good I/O (by default PARTIAL and COMPLY)."
+        ),
+    )
+
+    response_io_judged_file: str | None = Field(
+        default=None,
+        description="refusal-eval judged.jsonl whose labels are joined to response_io_file by row key.",
+    )
+
+    response_bad_labels: list[str] = Field(
+        default=["PARTIAL"],
+        description="Judge labels of the answers added to the bad I/O.",
+    )
+
+    response_good_labels: list[str] = Field(
+        default=["COMPLY"],
+        description="Judge labels of the answers added to the good I/O.",
+    )
+
+    response_tokens: PositiveInt = Field(
+        default=32,
+        description="Number of answer tokens averaged per answer.",
+    )
+
+    response_max_samples: PositiveInt = Field(
+        default=200,
+        description="Maximum number of answers per side (a fixed random subset is used beyond).",
     )
 
     # Fork additions for upstream issue #522: the loss only sees the subspace spanned by the
@@ -331,6 +370,32 @@ class ARA(Modifier[Parameters]):
         print()
         print("Obtaining module I/O for bad prompts...")
         self.bad_module_io = model.get_module_io_batched(bad_prompts)
+
+        if self.settings.response_io_file is not None:
+            # Fork addition: the module I/O of judged answers, averaged over their first
+            # answer tokens, is added to the bad (e.g. PARTIAL) and good (e.g. COMPLY)
+            # I/O, so that the loss also pulls the outputs of evasive answers towards
+            # those of real answers, where the evasion happens (not only at the end of
+            # the prompt).
+            print()
+            print("Obtaining module I/O for judged answers...")
+            bad_items, good_items = load_answer_items(
+                model,
+                self.settings.response_io_file,
+                self.settings.response_io_judged_file,
+                self.settings.response_bad_labels,
+                self.settings.response_good_labels,
+                self.settings.response_tokens,
+                self.settings.response_max_samples,
+            )
+            self.bad_module_io = append_module_io(
+                self.bad_module_io, module_io_means(model, bad_items)
+            )
+            self.good_module_io = append_module_io(
+                self.good_module_io, module_io_means(model, good_items)
+            )
+            self.bad_prompt_count += len(bad_items)
+            self.good_prompt_count += len(good_items)
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.

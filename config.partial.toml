@@ -1,0 +1,116 @@
+# Heretic configuration against PARTIAL answers (fork addition, see README-MOE.md, v6).
+#
+# Measured with the refusal-eval judge, abliteration turned refusals into PARTIAL answers
+# (overview instead of specifics, half the steps, educational pivot): Qwen3-8B t18 46.5%
+# PARTIAL, Qwen3.8-27B t96 55.8%, and on Qwen3-14B the keyword metric picked a trial with
+# 41.9% refusals. This config combines the levers that need no extra training:
+#
+# 1. Trials are re-ranked by the judge (n_judge_ranking_trials), not by keyword refusals.
+# 2. ARA's good prompts are benign technical requests with detailed answers instead of
+#    harmless_alpaca, so the target behavior is "a detailed professional answer".
+# 3. ARA also sees the module I/O of judged answers: PARTIAL answers on the bad side, COMPLY
+#    answers on the good side (response_io_file), so the loss acts where the evasion happens.
+#
+# Steps:
+# - Run refusal-eval on a previous trial (generate + judge) to get responses.jsonl and
+#   judged.jsonl; use runs of the same model. Train prompts only: answers to prompts of the
+#   evaluation hold-out must not be used, or the hold-out stops measuring generalization.
+#   (refusal-eval's offsec hold-out is evaluation data; generate training answers on other
+#   prompts, e.g. with heretic-dpo-pairs generate + judge.)
+# - Put the paths below, start the judge (Ollama with qwen3:14b), run heretic.
+# - Optional, once enough answers are judged: heretic-train-classifier, then make ClassifierRate
+#   an objective (below) instead of KeywordRate.
+#
+# Second pass instead (no code, but KL adds up): export the best trial, set model to the exported
+# directory, bad_prompts = the prompts the judge labelled PARTIAL, good_prompts = those labelled
+# COMPLY (text files), and keep the total KL against the original model in mind: KL of this run
+# is measured against the first-pass model.
+#
+# None of this has been measured yet; the values are starting points.
+
+model = "Qwen/Qwen3-8B"
+
+dtypes = ["auto", "bfloat16"]
+
+# The strict keyword counter inspects 256 answer tokens, and PARTIAL answers turn evasive late.
+max_response_length = 256
+
+modifiers = [
+    { plugin = "heretic.modifiers.ara.ARA" },
+]
+
+scorers = [
+    { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
+    # After heretic-train-classifier (binary kappa against the judge >= 0.75), replace the line above:
+    # { plugin = "heretic.scorers.classifier_rate.ClassifierRate", optimization = "minimize" },
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+]
+
+n_trials = 100
+n_startup_trials = 30
+
+# Judge the 8 best trials with KL <= 0.15 (and the original model) after the optimization.
+n_judge_ranking_trials = 8
+judge_ranking_max_kl = 0.15
+judge_ranking_response_length = 512
+
+# Prompt/response pairs of every keyword evaluation and of the judge ranking, for reading by hand.
+responses_file = "responses.jsonl"
+
+[scorer.KeywordRate]
+strict = true
+strict_window_tokens = 256
+
+[scorer.KeywordRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+# The judge (also used by n_judge_ranking_trials). Prompts: your own evaluation set, e.g. a
+# text file with refusal-eval's offsec hold-out prompts, one per line.
+[scorer.JudgeRate]
+endpoint = "http://localhost:11434"
+model = "qwen3:14b"
+# rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"
+
+[scorer.JudgeRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+[scorer.ClassifierRate]
+# model_path = "classifiers/nonanswer"
+
+[scorer.ClassifierRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+[modifier.ARA]
+# Judged answers of a previous trial of the same model (see the steps above).
+# response_io_file = "runs/qwen3-8b-t18/responses.jsonl"
+# response_io_judged_file = "runs/qwen3-8b-t18/judged.jsonl"
+response_bad_labels = ["PARTIAL"]
+response_good_labels = ["COMPLY"]
+response_tokens = 32
+response_max_samples = 200
+
+# Benign technical requests with detailed answers (a text file, one prompt per line), e.g.
+# defensive security, CTF write-ups, system administration. harmless_alpaca until you have one.
+[modifier.ARA.good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+# dataset = "prompts/technical_good.txt"
+
+# Your own offsec training prompts (not the evaluation hold-out), or harmful_behaviors.
+[modifier.ARA.bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+# dataset = "prompts/offsec_train.txt"

@@ -7,7 +7,6 @@
 
 import io
 import json
-import os
 import sys
 import tempfile
 import threading
@@ -30,7 +29,7 @@ from heretic.directions import (
     orthonormal_extension,
     train_som,
 )
-from heretic.judge import JudgeClient, compare, parse_label
+from heretic.judge import JudgeClient, compare
 from heretic.judge import main as judge_main
 from heretic.merged_scoring import (
     MERGED_SCORES_ATTR,
@@ -397,6 +396,8 @@ class RouterBiasTests(unittest.TestCase):
 
 
 class FakeJudge:
+    """Ollama /api/chat stand-in: labels by the first matching text, COMPLY otherwise."""
+
     def __init__(self, labels: dict[str, str]) -> None:
         self.labels = labels
         self.requests = 0
@@ -405,25 +406,18 @@ class FakeJudge:
         self.requests += 1
         content = payload["messages"][1]["content"]
         label = next(
-            (label for text, label in self.labels.items() if text in content), "comply"
+            (label for text, label in self.labels.items() if text in content), "COMPLY"
         )
-        return {"choices": [{"message": {"content": label}}]}
+        return {"message": {"content": json.dumps({"label": label, "reason": "r"})}}
 
 
 class JudgeTests(unittest.TestCase):
-    def test_parse_label(self) -> None:
-        self.assertEqual(parse_label("refuse"), "refuse")
-        self.assertEqual(parse_label(" Soft-Refuse."), "soft_refuse")
-        self.assertEqual(parse_label("<think>maybe comply</think>\nrefuse"), "refuse")
-        self.assertEqual(parse_label("Label: soft refuse"), "soft_refuse")
-        self.assertIsNone(parse_label("no idea"))
-
     def test_client_caches_and_skips_empty(self) -> None:
-        fake = FakeJudge({"Sorry": "refuse"})
+        fake = FakeJudge({"Nope": "REFUSAL"})
         client = JudgeClient(post=fake)
-        self.assertEqual(client.classify("p", "Sorry, no."), "refuse")
-        self.assertEqual(client.classify("p", "Sorry, no."), "refuse")
-        self.assertEqual(client.classify("p", "  "), "useless")
+        self.assertEqual(client.classify("p", "Nope."), "REFUSAL")
+        self.assertEqual(client.classify("p", "Nope."), "REFUSAL")
+        self.assertEqual(client.classify("p", "  "), "OFF_TOPIC")
         self.assertEqual(fake.requests, 1)
 
     def test_compare(self) -> None:
@@ -432,22 +426,22 @@ class JudgeTests(unittest.TestCase):
                 "score_name": "R",
                 "evaluation": 1,
                 "match": True,
-                "judge_label": "comply",
+                "judge_label": "COMPLY",
             },
             {
                 "score_name": "R",
                 "evaluation": 1,
                 "match": True,
-                "judge_label": "refuse",
+                "judge_label": "REFUSAL",
             },
             {
                 "score_name": "R",
                 "evaluation": 1,
                 "match": False,
-                "judge_label": "soft_refuse",
+                "judge_label": "PARTIAL",
             },
         ]
-        comparison = compare(records, ["refuse", "soft_refuse"])
+        comparison = compare(records, ["REFUSAL", "PARTIAL"])
         self.assertEqual(comparison.keyword[("R", 1)], 2)
         self.assertEqual(comparison.judge[("R", 1)], 2)
         self.assertEqual(comparison.agreement[(True, False)], 1)
@@ -460,11 +454,11 @@ class JudgeTests(unittest.TestCase):
         )
         scorer.prompts = [Prompt(system="s", user=u) for u in ("p1", "p2", "p3")]
         scorer.client = JudgeClient(
-            post=FakeJudge({"cannot": "refuse", "Hmm": "soft_refuse"})
+            post=FakeJudge({"cannot": "REFUSAL", "Hmm": "PARTIAL"})
         )
         responses = [
             "<think>I cannot decide</think>Sure, here it is.",
-            "I cannot help.",
+            "I cannot do that.",
             "Hmm, what do you mean?",
         ]
         ctx = cast(Context, SimpleNamespace(get_responses=lambda prompts: responses))
@@ -472,16 +466,20 @@ class JudgeTests(unittest.TestCase):
         # The reasoning is removed before judging, so the first answer complies.
         self.assertAlmostEqual(score.value, 2 / 3)
         self.assertFalse(scorer.reproducible)
-        with self.assertRaises(ValueError):
-            JudgeRateSettings(refusal_labels=["nope"])
 
     def test_cli_against_a_local_server(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 content = body["messages"][1]["content"]
-                label = "refuse" if "sorry" in content else "comply"
-                reply = json.dumps({"choices": [{"message": {"content": label}}]})
+                label = "REFUSAL" if "nope" in content else "COMPLY"
+                reply = json.dumps(
+                    {
+                        "message": {
+                            "content": json.dumps({"label": label, "reason": "r"})
+                        }
+                    }
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -497,11 +495,7 @@ class JudgeTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 responses = Path(directory, "responses.jsonl")
                 output = Path(directory, "labelled.jsonl")
-                rows = [
-                    (0, "sorry, no", True),
-                    (1, "here it is, illegal though", True),
-                    (1, "sorry", True),
-                ]
+                rows = [(0, "nope", True), (1, "here it is", True), (1, "nope", True)]
                 responses.write_text(
                     "".join(
                         json.dumps(
@@ -518,7 +512,7 @@ class JudgeTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                endpoint = f"http://127.0.0.1:{server.server_address[1]}/v1"
+                endpoint = f"http://127.0.0.1:{server.server_address[1]}"
                 with redirect_stdout(io.StringIO()):
                     judge_main(
                         [
@@ -538,7 +532,8 @@ class JudgeTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-        self.assertEqual([r["judge_label"] for r in labelled], ["comply", "refuse"])
+        self.assertEqual([r["judge_label"] for r in labelled], ["COMPLY", "REFUSAL"])
+        self.assertEqual(labelled[0]["judge_prompt"], "v1-039fd0fa")
 
     @unittest.skipIf(sys.version_info < (3, 11), "tomllib needs Python 3.11")
     def test_default_config_section(self) -> None:
@@ -549,7 +544,6 @@ class JudgeTests(unittest.TestCase):
             JudgeRate.get_settings_raw(config, "scorer", None)
         )
         self.assertEqual(documented, JudgeRateSettings())
-        self.assertEqual(os.path.basename(JudgeRateSettings().endpoint), "v1")
 
 
 if __name__ == "__main__":

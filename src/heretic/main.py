@@ -87,6 +87,13 @@ from .config import (
     QuantizationMethod,
 )
 from .evaluator import Evaluator
+from .judge_ranking import (
+    BASELINE_KEY,
+    format_judge_record,
+    get_judge_settings,
+    judge_trials,
+    rank_by_judge,
+)
 from .merged_scoring import rank_by_merged_scores, rescore_on_merged_models
 from .model import Model, get_model_class
 from .modifier import load_and_init_modifiers
@@ -837,6 +844,12 @@ def run():
                 sorted_trials, merged_scores, objective_names
             )
 
+            # Fork addition: judge the best trials and the original model with the
+            # refusal-eval judge, and list the judged trials first.
+            judge_scores = judge_trials(study, sorted_trials, settings, model, modifier)
+            sorted_trials = rank_by_judge(sorted_trials, judge_scores)
+            judge_labels = get_judge_settings(settings).labels if judge_scores else []
+
             def format_trial_title(trial: FrozenTrial) -> str:
                 prefix = f"[Trial {trial.user_attrs['index']:>3}]"
                 merged_displays = {
@@ -855,6 +868,12 @@ def run():
                     if name in merged_displays:
                         value = f"{value} -> {merged_displays[name]}"
                     score_parts.append(f"{name}: {value}")
+
+                judged = judge_scores.get(str(trial.number))
+                if judged is not None:
+                    score_parts.append(
+                        f"Judge: {format_judge_record(judged, judge_labels)}"
+                    )
 
                 return f"{prefix} " + ", ".join(score_parts)
 
@@ -888,6 +907,13 @@ def run():
                     "chat with it to test how well it works, or run standard benchmarks on it. "
                     "You can return to this menu later to select a different trial. "
                 )
+
+                if BASELINE_KEY in judge_scores:
+                    print(
+                        "Judge (not answered) of the original model: "
+                        f"[bold]{format_judge_record(judge_scores[BASELINE_KEY], judge_labels)}[/]. "
+                        "Judged trials are listed first, by their share of non-answers."
+                    )
 
                 if merged_scores:
                     print(

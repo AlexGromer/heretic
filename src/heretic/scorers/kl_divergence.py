@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, Field
+from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.plugin import Context
@@ -19,6 +21,30 @@ class Settings(BaseModel):
         ),
         description="Dataset of prompts used to measure KL divergence from original model.",
     )
+
+
+def kl_divergence_batchmean(logprobs: Tensor, baseline_logprobs: Tensor) -> float:
+    """
+    KL(baseline || current), summed over the vocabulary and averaged over the prompts.
+
+    Fork addition: some models mask reserved tokens with -inf logits (e.g. Gemma 4 12B,
+    reported by TrevorS/gemma-4-abliteration). There, F.kl_div computes 0 * (-inf - -inf)
+    = NaN. Tokens the baseline gives zero probability contribute 0 to the divergence by
+    definition, so they are masked. Without non-finite values, the computation is the
+    plain F.kl_div as before.
+    """
+    if bool(torch.isfinite(baseline_logprobs).all() and torch.isfinite(logprobs).all()):
+        return F.kl_div(
+            logprobs,
+            baseline_logprobs,
+            reduction="batchmean",
+            log_target=True,
+        ).item()
+
+    impossible = torch.isneginf(baseline_logprobs)
+    terms = baseline_logprobs.exp() * (baseline_logprobs - logprobs)
+    terms = torch.where(impossible, torch.zeros_like(terms), terms)
+    return (terms.sum() / baseline_logprobs.shape[0]).item()
 
 
 class KLDivergence(Scorer):
@@ -56,12 +82,7 @@ class KLDivergence(Scorer):
         logits = ctx.get_logits(self.prompts)
         logprobs = F.log_softmax(logits, dim=-1)
 
-        kl_divergence = F.kl_div(
-            logprobs,
-            self._baseline_logprobs,
-            reduction="batchmean",
-            log_target=True,
-        ).item()
+        kl_divergence = kl_divergence_batchmean(logprobs, self._baseline_logprobs)
 
         return Score(
             value=kl_divergence,

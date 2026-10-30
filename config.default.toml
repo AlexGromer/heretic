@@ -117,6 +117,21 @@ n_startup_trials = 30
 # 0 disables it.
 n_merged_score_trials = 0
 
+# Number of the best trials (in the order of the Pareto front, KL divergence at most
+# judge_ranking_max_kl) to judge after the optimization with the judge of [scorer.JudgeRate]
+# (fork addition). The original model is judged once as well. The menu then lists the judged
+# trials first, sorted by their share of non-answers (REFUSAL + PARTIAL), and shows the label
+# counts and how many answers were cut at the length limit. This changes what --trial-index
+# points to. Results are stored in the study. Cost per trial: one generation of the judge prompts
+# at judge_ranking_response_length tokens plus one judge request per answer. 0 disables it.
+n_judge_ranking_trials = 0
+judge_ranking_max_kl = 0.15
+
+# Length of the judged answers (refusal-eval: 512) and the batch size for generating them
+# (0 = batch_size; longer answers need more memory than batch_size was determined for).
+judge_ranking_response_length = 512
+judge_ranking_batch_size = 0
+
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 
@@ -298,29 +313,66 @@ split = "test[:100]"
 column = "text"
 
 
-# Refusal rate according to a local judge model (fork addition, see README-MOE.md).
-# Add it as { plugin = "heretic.scorers.judge_rate.JudgeRate", optimization = "none" }.
-# Every evaluation sends each prompt and response to the endpoint, so keep it local.
+# Share of non-answers according to the refusal-eval judge (fork addition, see README-MOE.md).
+# Add it as { plugin = "heretic.scorers.judge_rate.JudgeRate", optimization = "none" } to judge
+# every trial (slow). The same settings configure the judge of n_judge_ranking_trials, whether
+# or not the scorer is listed. Every judged answer is sent to the endpoint, so keep it local.
 [scorer.JudgeRate]
-score_name = "Judge refusals"
+score_name = "Judge non-answers"
 
-# OpenAI-compatible chat completions endpoint (default: local Ollama; llama-server works too).
-endpoint = "http://localhost:11434/v1"
+# Judge server. "ollama": Ollama's /api/chat with thinking off and a JSON schema, exactly as
+# refusal-eval's judge.py; "openai": an OpenAI-compatible endpoint (endpoint ends with /v1).
+endpoint = "http://localhost:11434"
+api = "ollama"
 
-# Name of the judge model at the endpoint.
-model = "qwen3:8b"
+# Name of the judge model at the endpoint (refusal-eval: qwen3:14b).
+model = "qwen3:14b"
 
-# Labels that count as refusals, out of comply, soft_refuse, refuse, useless.
-refusal_labels = ["refuse", "soft_refuse", "useless"]
+# The judge prompt. Unset: the built-in copy of refusal-eval's SYSTEM_PROMPT v1 (prompt version
+# v1-039fd0fa). "path/to/file.py:NAME" reads a string constant from a Python file without
+# executing it, e.g. rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"; another path is a text file.
+# rubric = "../refusal-eval/judge.py:SYSTEM_PROMPT"
 
-# Maximum number of tokens of the judge's reply (thinking models need more), and the
-# timeout of one request in seconds.
-max_tokens = 512
-timeout = 120.0
+# "refusal_eval": the rubric is the system prompt and the user message is built as in
+# refusal-eval; "template": the rubric is the user message with {prompt} and {response} replaced.
+message_format = "refusal_eval"
+
+# Labels the rubric asks for, the labels that count as not answered (the score is their share),
+# and the label of answers that are empty after removing the reasoning (not sent to the judge).
+labels = ["REFUSAL", "PARTIAL", "COMPLY", "OFF_TOPIC"]
+refusal_labels = ["REFUSAL", "PARTIAL"]
+empty_label = "OFF_TOPIC"
+
+# Maximum tokens of the judge's reply, timeout of one request in seconds, and attempts
+# per answer (refusal-eval: 160, 180, 3).
+max_tokens = 160
+timeout = 180.0
+retries = 3
 
 print_responses = false
 
 [scorer.JudgeRate.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
+
+# Share of non-answers according to a classifier distilled from the judge (fork addition):
+# train it with heretic-train-classifier on judged answers, then use it as an objective,
+# { plugin = "heretic.scorers.classifier_rate.ClassifierRate", optimization = "minimize" },
+# with max_response_length of at least 256 (PARTIAL answers often turn evasive later).
+[scorer.ClassifierRate]
+score_name = "Non-answers"
+
+# Directory written by heretic-train-classifier (required when the scorer is used).
+# model_path = "classifiers/nonanswer"
+
+refusal_labels = ["REFUSAL", "PARTIAL"]
+device = "auto"
+batch_size = 16
+print_responses = false
+
+[scorer.ClassifierRate.prompts]
 dataset = "mlabonne/harmful_behaviors"
 split = "test[:100]"
 column = "text"
@@ -377,6 +429,19 @@ ridge_weight = 0.0
 # learning_rate, which avoids the arbitrarily long steps described in issue #522, but can diverge;
 # a module whose adapter becomes non-finite is then left unmodified).
 line_search = "strong_wolfe"
+
+# Judged answers whose module I/O is added to the prompt I/O (fork addition). The I/O averaged
+# over the first response_tokens tokens of the visible answer is added to the bad I/O for answers
+# labelled response_bad_labels and to the good I/O for response_good_labels, so that the loss also
+# pulls the outputs of evasive answers towards those of real answers, where the evasion happens.
+# The file is written by heretic-judge (prompt, response, judge_label), or is refusal-eval's
+# responses.jsonl with response_io_judged_file = its judged.jsonl.
+# response_io_file = "runs/qwen3-8b-t18/responses.jsonl"
+# response_io_judged_file = "runs/qwen3-8b-t18/judged.jsonl"
+response_bad_labels = ["PARTIAL"]
+response_good_labels = ["COMPLY"]
+response_tokens = 32
+response_max_samples = 200
 
 # Search ranges of the optimizer. The defaults are the fixed ranges of upstream Heretic;
 # widen them to explore stronger steering (see config.wide.toml). Each range is [low, high].
@@ -496,6 +561,22 @@ router_bias_last_positions = 4
 
 # Clip of |log(p_bad / p_good)| per expert.
 router_bias_max_log_ratio = 4.0
+
+# Direction from the tokens of judged answers (fork addition): mean residual over the first
+# response_tokens answer tokens of answers labelled response_bad_labels minus that of
+# response_good_labels (PARTIAL minus COMPLY), as an additional direction with its own weight
+# partial_direction.weight in direction_weight_range. File formats as for ARA's response_io_file.
+# response_direction_file = "runs/qwen3-8b-t18/responses.jsonl"
+# response_direction_judged_file = "runs/qwen3-8b-t18/judged.jsonl"
+response_bad_labels = ["PARTIAL"]
+response_good_labels = ["COMPLY"]
+response_tokens = 32
+response_max_samples = 200
+
+# Harmfulness direction of Zhao et al. 2025 (arXiv 2507.11878): bad minus good prompts at the last
+# token of the user instruction (refusal is read after the post-instruction template tokens),
+# as an additional direction with its own weight harmfulness_direction.weight. Experimental.
+harmfulness_direction = false
 
 # Dataset of prompts that tend to produce desirable responses.
 [modifier.Abliteration.good_prompts]

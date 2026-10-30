@@ -451,6 +451,39 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    n_judge_ranking_trials: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "Number of the best trials (in the order of the Pareto front, within "
+            "judge_ranking_max_kl) to judge after the optimization with the judge configured in "
+            "[scorer.JudgeRate] (fork addition). The original model is judged once as well. The "
+            "menu then lists the judged trials first, sorted by their share of non-answers "
+            "(REFUSAL + PARTIAL by default), which changes what --trial-index points to. "
+            "Results are stored in the study. 0 disables it."
+        ),
+    )
+
+    judge_ranking_max_kl: float = Field(
+        default=0.15,
+        description="Largest KL divergence of a trial that is judged.",
+    )
+
+    judge_ranking_response_length: PositiveInt = Field(
+        default=512,
+        description=(
+            "Maximum number of tokens of each answer that is judged (refusal-eval uses 512). "
+            "Longer than max_response_length, because PARTIAL answers often turn evasive later."
+        ),
+    )
+
+    judge_ranking_batch_size: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "Batch size for generating the judged answers (0 = batch_size). Longer answers need "
+            "more memory than the batch size was determined for."
+        ),
+    )
+
     n_merged_score_trials: NonNegativeInt = Field(
         default=0,
         description=(

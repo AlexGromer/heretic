@@ -60,6 +60,8 @@ Changelog = "https://github.com/p-e-w/heretic/releases"
 heretic = "heretic.main:main"
 heretic-generalization = "heretic.generalization:main"
 heretic-judge = "heretic.judge:main"
+heretic-train-classifier = "heretic.classifier:main"
+heretic-dpo-pairs = "heretic.dpo:main"
 
 [build-system]
 requires = ["uv_build>=0.12.21,<0.13.0"]

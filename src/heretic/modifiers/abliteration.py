@@ -22,7 +22,11 @@ from pydantic import (
 from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
-from heretic.directions import compute_extra_directions, interpolate_extras
+from heretic.directions import (
+    compute_extra_directions,
+    interpolate_extras,
+    orthonormal_extension,
+)
 from heretic.ega import (
     EgaPlan,
     FrequencyScaling,
@@ -31,6 +35,11 @@ from heretic.ega import (
 )
 from heretic.model import FUSED_EXPERTS_WEIGHT_COMPONENT
 from heretic.modifier import Context, Modifier, Serializable
+from heretic.positions import (
+    instruction_end_position,
+    load_answer_items,
+    position_direction,
+)
 from heretic.ranges import check_range
 from heretic.router_bias import (
     RouterBiasPlan,
@@ -57,6 +66,9 @@ class Parameters(Serializable):
     # router pre-bias (see Settings.router_bias).
     direction_weights: list[float] = field(default_factory=list)
     router_bias_alpha: float = 0.0
+    # Names of the additional directions, aligned with direction_weights
+    # (e.g. "direction_1", "partial_direction", "harmfulness_direction").
+    direction_names: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,7 +87,12 @@ class Parameters(Serializable):
                 parameters[f"{component}.{name}"] = f"{value:.2f}"
 
         for index, weight in enumerate(self.direction_weights, start=1):
-            parameters[f"direction_{index}.weight"] = f"{weight:.2f}"
+            name = (
+                self.direction_names[index - 1]
+                if index <= len(self.direction_names)
+                else f"direction_{index}"
+            )
+            parameters[f"{name}.weight"] = f"{weight:.2f}"
 
         if self.router_bias_alpha:
             parameters["router_bias_alpha"] = f"{self.router_bias_alpha:.2f}"
@@ -94,6 +111,7 @@ class Parameters(Serializable):
             },
             direction_weights=list(data.get("direction_weights", [])),
             router_bias_alpha=data.get("router_bias_alpha", 0.0),
+            direction_names=list(data.get("direction_names", [])),
         )
 
 
@@ -321,6 +339,55 @@ class Settings(BaseModel):
         description="Final neighborhood radius of the self-organizing map (it starts at half the grid size).",
     )
 
+    # Directions at other token positions (fork addition, see heretic/positions.py).
+    response_direction_file: str | None = Field(
+        default=None,
+        description=(
+            "JSON Lines file of judged answers (prompt, response and judge_label, as written by "
+            "heretic-judge; or refusal-eval's responses.jsonl with response_direction_judged_file). "
+            "Adds a direction from the answer tokens: mean over the first response_tokens answer "
+            "tokens of answers labelled response_bad_labels minus the same for "
+            "response_good_labels (by default PARTIAL minus COMPLY), with its own weight "
+            "partial_direction.weight in direction_weight_range."
+        ),
+    )
+
+    response_direction_judged_file: str | None = Field(
+        default=None,
+        description="refusal-eval judged.jsonl whose labels are joined to response_direction_file by row key.",
+    )
+
+    response_bad_labels: list[str] = Field(
+        default=["PARTIAL"],
+        description="Judge labels of the answers whose tokens define the bad side of the response direction.",
+    )
+
+    response_good_labels: list[str] = Field(
+        default=["COMPLY"],
+        description="Judge labels of the answers whose tokens define the good side.",
+    )
+
+    response_tokens: PositiveInt = Field(
+        default=32,
+        description="Number of answer tokens (from the start of the visible answer) averaged per answer.",
+    )
+
+    response_max_samples: PositiveInt = Field(
+        default=200,
+        description="Maximum number of answers per side (a fixed random subset is used beyond).",
+    )
+
+    harmfulness_direction: bool = Field(
+        default=False,
+        description=(
+            "Adds the harmfulness direction of Zhao et al. 2025 (arXiv 2507.11878): the difference "
+            "of the mean residuals of bad and good prompts at the last token of the user "
+            "instruction (before the post-instruction template tokens, where the classic refusal "
+            "direction is taken), with its own weight harmfulness_direction.weight. Experimental: "
+            "it targets the model's notion of harm, which can also affect answer quality."
+        ),
+    )
+
     # Router pre-bias for MoE models (fork addition, upstream #322).
     router_bias: bool = Field(
         default=False,
@@ -441,6 +508,7 @@ class Abliteration(Modifier[Parameters]):
     # Fork additions, set by init. The class defaults (no extra directions, no router
     # pre-bias) also apply to instances that are set up without init, e.g. in tests.
     extra_directions: Tensor | None = None
+    extra_direction_names: tuple[str, ...] = ()
     router_plans: tuple[RouterBiasPlan, ...] = ()
 
     @property
@@ -519,9 +587,10 @@ class Abliteration(Modifier[Parameters]):
                 dim=1,
             )
 
-        # Additional directions per residual row (fork addition, #140):
-        # shape (row, direction_count - 1, hidden).
+        # Additional directions per residual row (fork additions): shape
+        # (row, slot, hidden), one slot per direction with its own weight.
         self.extra_directions = None
+        self.extra_direction_names = ()
         if self.settings.direction_count > 1:
             print(
                 f"* Fitting self-organizing maps for [bold]{self.settings.direction_count - 1}[/] "
@@ -547,18 +616,48 @@ class Abliteration(Modifier[Parameters]):
                 f"* Additional directions found per layer: min [bold]{int(found.min())}[/], "
                 f"max [bold]{int(found.max())}[/]"
             )
+            self.extra_direction_names = tuple(
+                f"direction_{index}"
+                for index in range(1, self.settings.direction_count)
+            )
 
+        if self.settings.response_direction_file is not None:
+            print("* Obtaining the response direction from judged answers...")
+            bad_items, good_items = load_answer_items(
+                model,
+                self.settings.response_direction_file,
+                self.settings.response_direction_judged_file,
+                self.settings.response_bad_labels,
+                self.settings.response_good_labels,
+                self.settings.response_tokens,
+                self.settings.response_max_samples,
+            )
+            self._add_extra_direction(
+                "partial_direction",
+                position_direction(model, bad_items, good_items),
+                good_means,
+            )
+
+        if self.settings.harmfulness_direction:
+            print("* Obtaining the harmfulness direction at the instruction end...")
+            self._add_extra_direction(
+                "harmfulness_direction",
+                position_direction(
+                    model,
+                    [instruction_end_position(model, p) for p in bad_prompts],
+                    [instruction_end_position(model, p) for p in good_prompts],
+                ),
+                good_means,
+            )
+
+        extra_count = len(self.extra_direction_names)
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization
             # (one rank per direction with several directions).
-            self.lora_rank = self.settings.direction_count
+            self.lora_rank = 1 + extra_count
         else:
             # Row magnitude preservation introduces nonlinear effects.
-            self.lora_rank = (
-                self.settings.full_normalization_lora_rank
-                + self.settings.direction_count
-                - 1
-            )
+            self.lora_rank = self.settings.full_normalization_lora_rank + extra_count
 
         if model.has_fused_experts():
             print()
@@ -634,6 +733,36 @@ class Abliteration(Modifier[Parameters]):
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
         model.apply_lora(self.lora_rank)
+
+    def _add_extra_direction(
+        self, name: str, directions: Tensor, good_means: Tensor
+    ) -> None:
+        """
+        Appends a slot with one direction per residual row, made orthogonal to the classic
+        direction, the good direction (with orthogonalize_direction) and the existing slots.
+        A row where nothing new remains gets a zero direction (it is then skipped).
+        """
+        rows, hidden = self.residual_directions.shape
+        slot = torch.zeros(rows, hidden)
+        for row in range(rows):
+            basis = [self.residual_directions[row].cpu().float()]
+            if self.settings.orthogonalize_direction:
+                basis.append(F.normalize(good_means[row].cpu().float(), p=2, dim=0))
+            if self.extra_directions is not None:
+                existing = self.extra_directions[row].cpu()
+                basis += [d for d in existing if bool(d.norm() > 0)]
+            slot[row] = orthonormal_extension(
+                torch.stack(basis), directions[row][None].cpu().float(), 1
+            )[0]
+        slot = slot.to(self.residual_directions.device)[:, None, :]
+        self.extra_directions = (
+            slot
+            if self.extra_directions is None
+            else torch.cat([self.extra_directions, slot], dim=1)
+        )
+        self.extra_direction_names = (*self.extra_direction_names, name)
+        present = int((slot.norm(dim=2) > 0).sum())
+        print(f"* [bold]{name}[/]: present in {present} of {rows} residual rows")
 
     def suggest_parameters(self, ctx: Context, trial: Trial) -> Parameters:
         model = ctx.get_model()
@@ -724,11 +853,11 @@ class Abliteration(Modifier[Parameters]):
 
         direction_weights = [
             trial.suggest_float(
-                f"direction_{index}.weight",
+                f"{name}.weight",
                 self.settings.direction_weight_range[0],
                 self.settings.direction_weight_range[1],
             )
-            for index in range(1, self.settings.direction_count)
+            for name in self.extra_direction_names
         ]
 
         router_bias_alpha = (
@@ -746,6 +875,7 @@ class Abliteration(Modifier[Parameters]):
             weight_distributions=weight_distributions,
             direction_weights=direction_weights,
             router_bias_alpha=router_bias_alpha,
+            direction_names=list(self.extra_direction_names),
         )
 
     def global_residual_direction(self, direction_index: float) -> Tensor:

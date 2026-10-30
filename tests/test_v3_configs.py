@@ -89,6 +89,11 @@ class ExampleConfigTests(unittest.TestCase):
                 "router_bias_alpha_range",
                 "router_bias_last_positions",
                 "router_bias_max_log_ratio",
+                "response_bad_labels",
+                "response_good_labels",
+                "response_tokens",
+                "response_max_samples",
+                "harmfulness_direction",
             ):
                 if hasattr(defaults, key):
                     self.assertEqual(
@@ -123,6 +128,13 @@ class ExampleConfigTests(unittest.TestCase):
         self.assertEqual(prompts.column, "prompt")
         self.assertEqual(prompts.sample_size, 100)
         self.assertEqual(cast(Any, base).prompts.dataset, "mlabonne/harmful_behaviors")
+
+    def test_partial_config(self) -> None:
+        config = self.check("config.partial.toml")
+        self.assertEqual(config["n_judge_ranking_trials"], 8)
+        settings = ARA.validate_settings(ARA.get_settings_raw(config, "modifier", None))
+        assert settings is not None
+        self.assertEqual(cast(Any, settings).response_bad_labels, ["PARTIAL"])
 
     def test_moe_ega_config(self) -> None:
         config = self.check("config.moe-ega.toml")
