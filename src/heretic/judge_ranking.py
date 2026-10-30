@@ -13,6 +13,7 @@
 import json
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from .model import Model
 from .modifier import Context, Modifier
 from .scorers.judge_rate import JudgeRate, judge_responses
 from .scorers.judge_rate import Settings as JudgeSettings
-from .utils import format_exception, load_prompts, print
+from .utils import Prompt, format_exception, load_prompts, print
 
 # Study user attribute with the judge results, by trial number (as a string) and "baseline".
 JUDGE_SCORES_ATTR = "judge_scores"
@@ -50,6 +51,20 @@ def score_value(trial: FrozenTrial, name: str) -> float | None:
             if record["name"] == name
         ),
         None,
+    )
+
+
+def select_trial_by_number(study: Study, number: int) -> FrozenTrial:
+    """The completed trial shown as "[Trial number]" (its "index" attribute)."""
+    from optuna.trial import TrialState
+
+    from .utils import HereticUserError
+
+    for trial in study.get_trials(states=(TrialState.COMPLETE,)):
+        if trial.user_attrs.get("index") == number:
+            return trial
+    raise HereticUserError(
+        f"There is no completed trial {number} in this study (--trial-number)."
     )
 
 
@@ -148,6 +163,185 @@ def append_responses(
             file.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+@dataclass
+class RankingPrompt:
+    id: str
+    category: str
+    prompt: Prompt
+
+
+def load_ranking_prompts(
+    settings: Settings, judge_settings: JudgeSettings
+) -> list[RankingPrompt]:
+    """
+    The ranking prompts: from judge_ranking_prompts_file (JSON Lines with id, category,
+    prompt), or from the [scorer.JudgeRate] prompts with ids <set>-<line>.
+    """
+    if settings.judge_ranking_prompts_file is not None:
+        prompts = []
+        with open(settings.judge_ranking_prompts_file, encoding="utf-8") as file:
+            for index, line in enumerate(line for line in file if line.strip()):
+                row = json.loads(line)
+                prompts.append(
+                    RankingPrompt(
+                        id=str(
+                            row.get("id", f"{settings.judge_ranking_set}-{index:04d}")
+                        ),
+                        category=str(row.get("category", "")),
+                        prompt=Prompt(
+                            system=settings.system_prompt, user=row["prompt"]
+                        ),
+                    )
+                )
+        return prompts
+
+    return [
+        RankingPrompt(
+            id=f"{settings.judge_ranking_set}-{index:04d}", category="", prompt=p
+        )
+        for index, p in enumerate(load_prompts(settings, judge_settings.prompts))
+    ]
+
+
+def generate_answers(
+    settings: Settings,
+    model: Model,
+    modifier: Modifier[Any],
+    ctx: Context,
+    trial: FrozenTrial | None,
+    prompts: list[Prompt],
+) -> list[str]:
+    """Answers of the original model (trial None) or of a trial, at the ranking length."""
+    modifier.reset_model(ctx)
+    if trial is not None:
+        modifier.modify_model(
+            ctx,
+            modifier.parameters_class.from_dict(trial.user_attrs["parameters"]),
+        )
+    with generation_settings(
+        settings,
+        settings.judge_ranking_response_length,
+        settings.judge_ranking_batch_size,
+    ):
+        return model.get_responses_batched(prompts, skip_special_tokens=True)
+
+
+def refusal_eval_key(model_name: str, trial: str, set_name: str, prompt_id: str) -> str:
+    # refusal-eval generate_colab.make_key, for greedy answers without thinking.
+    return f"{model_name}|{trial}|greedy|false|{set_name}|{prompt_id}"
+
+
+def write_candidate_answers(
+    sorted_trials: list[FrozenTrial],
+    settings: Settings,
+    model: Model,
+    modifier: Modifier[Any],
+) -> str | None:
+    """
+    The "generate" mode: appends the answers of the original model ("base") and of the
+    candidate trials (labelled with their trial numbers) to judge_ranking_output, in the
+    format of refusal-eval's responses.jsonl, skipping keys already there. Returns the path.
+    """
+    if settings.n_judge_ranking_trials == 0:
+        return None
+    output = settings.judge_ranking_output
+    if output is None:
+        raise ValueError('judge_ranking_mode = "generate" needs judge_ranking_output')
+
+    judge_settings = get_judge_settings(settings)
+    prompts = load_ranking_prompts(settings, judge_settings)
+    model_name = settings.judge_ranking_model_name or Path(settings.model).name
+    candidates = select_candidates(
+        sorted_trials, settings.n_judge_ranking_trials, settings.judge_ranking_max_kl
+    )
+
+    done: set[str] = set()
+    if Path(output).exists():
+        with open(output, encoding="utf-8") as file:
+            for line in file:
+                try:
+                    done.add(json.loads(line)["key"])
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    # A torn last line of an interrupted run.
+                    continue
+
+    jobs: list[tuple[str, FrozenTrial | None]] = [("base", None)] + [
+        (str(t.user_attrs["index"]), t) for t in candidates
+    ]
+    jobs = [
+        (label, trial)
+        for label, trial in jobs
+        if any(
+            refusal_eval_key(model_name, label, settings.judge_ranking_set, p.id)
+            not in done
+            for p in prompts
+        )
+    ]
+
+    print()
+    print(
+        f"Writing answers of the original model and the best trials for judging to "
+        f"[bold]{output}[/] ({len(jobs)} still to generate, "
+        f"{settings.judge_ranking_response_length} tokens per answer)..."
+    )
+    ctx = Context(settings=settings, model=model)
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    run_settings = {
+        "max_new_tokens": settings.judge_ranking_response_length,
+        "system_prompt": settings.system_prompt,
+        "response_prefix": settings.response_prefix,
+        "temperature": 0.0,
+        "generator": "heretic",
+    }
+
+    for label, trial in jobs:
+        title = "Original model" if trial is None else f"Trial {label}"
+        try:
+            responses = generate_answers(
+                settings, model, modifier, ctx, trial, [p.prompt for p in prompts]
+            )
+        except Exception as error:
+            print(f"[yellow]{title}: generation failed ({format_exception(error)}).[/]")
+            continue
+
+        rows = []
+        for ranking_prompt, response in zip(prompts, responses):
+            key = refusal_eval_key(
+                model_name, label, settings.judge_ranking_set, ranking_prompt.id
+            )
+            if key in done:
+                continue
+            ids = model.tokenizer(response, add_special_tokens=False)["input_ids"]
+            rows.append(
+                {
+                    "key": key,
+                    "model": model_name,
+                    "trial": label,
+                    "mode": "greedy",
+                    "thinking": False,
+                    "set": settings.judge_ranking_set,
+                    "prompt_id": ranking_prompt.id,
+                    "category": ranking_prompt.category,
+                    "seed": 0,
+                    "prompt": ranking_prompt.prompt.user,
+                    "response": response,
+                    "n_gen_tokens": len(ids),
+                    "finish": "length"
+                    if len(ids) >= settings.judge_ranking_response_length
+                    else "stop",
+                    "win100": model.tokenizer.decode(ids[:100]),
+                    "win256": model.tokenizer.decode(ids[:256]),
+                    "settings": run_settings,
+                }
+            )
+        with open(output, "a", encoding="utf-8") as file:
+            file.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        print(f"* {title}: {len(rows)} answers written")
+
+    modifier.reset_model(ctx)
+    return output
+
+
 def judge_trials(
     study: Study,
     sorted_trials: list[FrozenTrial],
@@ -187,7 +381,7 @@ def judge_trials(
         f"[bold]{judge_settings.model}[/] (prompt {version}), "
         f"{settings.judge_ranking_response_length} tokens per answer..."
     )
-    prompts = load_prompts(settings, judge_settings.prompts)
+    prompts = [p.prompt for p in load_ranking_prompts(settings, judge_settings)]
     ctx = Context(settings=settings, model=model)
 
     jobs: list[tuple[str, FrozenTrial | None]] = []
@@ -200,20 +394,7 @@ def judge_trials(
             "Original model" if trial is None else f"Trial {trial.user_attrs['index']}"
         )
         try:
-            modifier.reset_model(ctx)
-            if trial is not None:
-                modifier.modify_model(
-                    ctx,
-                    modifier.parameters_class.from_dict(trial.user_attrs["parameters"]),
-                )
-            with generation_settings(
-                settings,
-                settings.judge_ranking_response_length,
-                settings.judge_ranking_batch_size,
-            ):
-                responses = model.get_responses_batched(
-                    prompts, skip_special_tokens=True
-                )
+            responses = generate_answers(settings, model, modifier, ctx, trial, prompts)
             result = judge_responses(
                 client, prompts, responses, judge_settings.refusal_labels
             )

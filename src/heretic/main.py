@@ -93,6 +93,8 @@ from .judge_ranking import (
     get_judge_settings,
     judge_trials,
     rank_by_judge,
+    select_trial_by_number,
+    write_candidate_answers,
 )
 from .merged_scoring import rank_by_merged_scores, rescore_on_merged_models
 from .model import Model, get_model_class
@@ -845,8 +847,29 @@ def run():
             )
 
             # Fork addition: judge the best trials and the original model with the
-            # refusal-eval judge, and list the judged trials first.
-            judge_scores = judge_trials(study, sorted_trials, settings, model, modifier)
+            # refusal-eval judge, and list the judged trials first. In the "generate"
+            # mode, the answers are only written for judging in another process.
+            judge_scores: dict[str, dict[str, Any]] = {}
+            if settings.judge_ranking_mode == "generate":
+                written = write_candidate_answers(
+                    sorted_trials, settings, model, modifier
+                )
+                if written is not None:
+                    print(
+                        f"* Judge [bold]{written}[/] separately (e.g. judge_colab.py batch), "
+                        "then select a trial with --trial-number N "
+                        '(the trial numbers are the "trial" field; "base" is the original model).'
+                    )
+                    if (
+                        settings.trial_index is None
+                        and settings.trial_number is None
+                        and not is_interactive()
+                    ):
+                        return
+            else:
+                judge_scores = judge_trials(
+                    study, sorted_trials, settings, model, modifier
+                )
             sorted_trials = rank_by_judge(sorted_trials, judge_scores)
             judge_labels = get_judge_settings(settings).labels if judge_scores else []
 
@@ -899,7 +922,13 @@ def run():
             print()
             print("[bold green]Optimization finished![/]")
 
-            if settings.trial_index is None:
+            selected_trial = (
+                select_trial_by_number(study, settings.trial_number)
+                if settings.trial_number is not None
+                else None
+            )
+
+            if settings.trial_index is None and settings.trial_number is None:
                 print()
                 print(
                     "The following trials resulted in Pareto optimal combinations of the optimization objectives. "
@@ -933,7 +962,7 @@ def run():
 
         while trial_loop_active:
             # Ensure a predefined trial is only processed once.
-            if settings.trial_index is not None:
+            if settings.trial_index is not None or settings.trial_number is not None:
                 trial_loop_active = False
 
             if reproduction_mode:
@@ -948,11 +977,13 @@ def run():
                 print()
                 print("Restoring model from reproduction information...")
             else:
-                if settings.trial_index is None:
+                if settings.trial_index is None and settings.trial_number is None:
                     print()
 
                 trial = ask_if_unset(
-                    None
+                    selected_trial
+                    if selected_trial is not None
+                    else None
                     if settings.trial_index is None
                     else sorted_trials[settings.trial_index],
                     questionary.select(

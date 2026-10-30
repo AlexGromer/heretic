@@ -463,6 +463,47 @@ class Settings(BaseSettings):
         ),
     )
 
+    judge_ranking_mode: Literal["judge", "generate"] = Field(
+        default="judge",
+        description=(
+            '"judge": judge the answers of the ranked trials here, via the judge endpoint. '
+            '"generate": only generate them and write them to judge_ranking_output in the format of '
+            "refusal-eval's responses.jsonl, for judging in a separate process (e.g. judge_colab.py, "
+            "which must not share the GPU with the evaluated model); then select the trial with "
+            "--trial-number."
+        ),
+    )
+
+    judge_ranking_output: str | None = Field(
+        default=None,
+        description=(
+            'JSON Lines file the "generate" mode appends the answers to (refusal-eval responses '
+            "format; keys already in the file are skipped, so an interrupted run resumes)."
+        ),
+        exclude=True,
+    )
+
+    judge_ranking_prompts_file: str | None = Field(
+        default=None,
+        description=(
+            "JSON Lines file of the ranking prompts with id, category and prompt fields, such as "
+            "refusal-eval's train/bad_eval.meta.jsonl. Unset uses the [scorer.JudgeRate] prompts "
+            "(ids are then <set>-<line>). Do not rank on the evaluation hold-out, or the hold-out "
+            "no longer measures the selected model independently."
+        ),
+        exclude=True,
+    )
+
+    judge_ranking_set: str = Field(
+        default="bad_eval",
+        description='Set name written into the generated rows (refusal-eval "set").',
+    )
+
+    judge_ranking_model_name: str | None = Field(
+        default=None,
+        description="Model label written into the generated rows (default: the last part of the model path).",
+    )
+
     judge_ranking_max_kl: float = Field(
         default=0.15,
         description="Largest KL divergence of a trial that is judged.",
@@ -590,6 +631,15 @@ class Settings(BaseSettings):
     trial_index: NonNegativeInt | None = Field(
         default=None,
         description="Index (in the sorted Pareto front) of the trial to use, or unset to prompt the user.",
+    )
+
+    trial_number: PositiveInt | None = Field(
+        default=None,
+        description=(
+            'Number of the trial to use, as shown in "[Trial N]" (fork addition). Unlike trial_index, '
+            "it does not depend on the order of the menu, and any completed trial can be selected, "
+            "not only Pareto optimal ones."
+        ),
     )
 
     n_additional_trials: PositiveInt | None = Field(

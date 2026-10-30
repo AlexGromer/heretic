@@ -136,6 +136,15 @@ class ExampleConfigTests(unittest.TestCase):
         assert settings is not None
         self.assertEqual(cast(Any, settings).response_bad_labels, ["PARTIAL"])
 
+    def test_colab_config(self) -> None:
+        config = self.check("config.colab.toml")
+        self.assertEqual(config["judge_ranking_mode"], "generate")
+        settings = ARA.validate_settings(ARA.get_settings_raw(config, "modifier", None))
+        assert settings is not None
+        self.assertTrue(
+            cast(Any, settings).bad_prompts.dataset.endswith("bad_train.txt")
+        )
+
     def test_moe_ega_config(self) -> None:
         config = self.check("config.moe-ega.toml")
         settings = Abliteration.validate_settings(

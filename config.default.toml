@@ -127,6 +127,21 @@ n_merged_score_trials = 0
 n_judge_ranking_trials = 0
 judge_ranking_max_kl = 0.15
 
+# "judge": judge here via the judge endpoint. "generate": only write the answers of the original
+# model ("base") and the ranked trials to judge_ranking_output in refusal-eval's responses.jsonl
+# format (keys already there are skipped), for judging in a separate process such as
+# judge_colab.py, which must not share the GPU with the evaluated model. Then select the trial
+# with --trial-number N (the "trial" field). Without a terminal, Heretic exits after writing.
+judge_ranking_mode = "judge"
+# judge_ranking_output = "/content/drive/MyDrive/heretic/candidates.responses.jsonl"
+
+# Ranking prompts as JSON Lines with id, category and prompt (e.g. refusal-eval's
+# train/bad_eval.meta.jsonl); unset uses the [scorer.JudgeRate] prompts. Do not rank on the
+# evaluation hold-out. Set name and model label written into the generated rows.
+# judge_ranking_prompts_file = "refusal-eval/train/bad_eval.meta.jsonl"
+judge_ranking_set = "bad_eval"
+# judge_ranking_model_name = "qwen3-8b-heretic"
+
 # Length of the judged answers (refusal-eval: 512) and the batch size for generating them
 # (0 = batch_size; longer answers need more memory than batch_size was determined for).
 judge_ranking_response_length = 512

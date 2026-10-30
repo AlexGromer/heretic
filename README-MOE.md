@@ -417,3 +417,24 @@ PARTIAL is a hypothesis: measure judge rates, KL and GSM8K.
 * refusal-eval (branch `partial-diagnostics`): judged rows keep `finish`, the summary counts PARTIAL
   answers cut at the token limit, `generate_colab.py --system-prompt-file` for an
   authorized-pentest system prompt.
+
+# Colab handoff (branch `colab-handoff`)
+
+For the Colab pipeline, where the judge (`refusal-eval/judge_colab.py`) runs in its own process and
+must not share the GPU with the evaluated model:
+
+* `judge_ranking_mode = "generate"`: after the optimization, Heretic writes the answers of the
+  original model (`trial` "base") and of the best `n_judge_ranking_trials` trials within
+  `judge_ranking_max_kl` to `judge_ranking_output`, in refusal-eval's `responses.jsonl` format
+  (same key as `generate_colab.make_key`, greedy, thinking off, `finish`, `win100` / `win256`,
+  `settings.generator = "heretic"`). Keys already in the file are skipped, so an interrupted run
+  resumes. Without a terminal, Heretic exits after writing. Prompts:
+  `judge_ranking_prompts_file` (JSON Lines with id, category, prompt, e.g.
+  `train/bad_eval.meta.jsonl`), set name `judge_ranking_set`, model label `judge_ranking_model_name`.
+* `--trial-number N` selects the trial shown as `[Trial N]` (the `trial` field of the rows), from
+  all completed trials, independent of the menu order; `--trial-index` still counts menu positions.
+* `config.colab.toml`: refusal-eval `train/` sets (bad_train / good_train for ARA, bad_eval for the
+  keyword objective and the ranking, alpaca test[:100] for KL), study and files on Google Drive,
+  the two-run recipe (optimize and write candidates; judge; export trial N) in its header.
+
+Tests: `tests/test_colab_handoff.py`.
