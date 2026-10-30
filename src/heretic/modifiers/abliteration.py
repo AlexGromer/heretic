@@ -27,6 +27,9 @@ from heretic.directions import (
     compute_extra_directions,
     interpolate_extras,
     orthonormal_extension,
+    paired_differences,
+    paired_svd_directions,
+    whiten,
 )
 from heretic.ega import (
     EgaPlan,
@@ -128,6 +131,20 @@ class Parameters(Serializable):
             router_bias_alphas=dict(data.get("router_bias_alphas", {})),
             direction_names=list(data.get("direction_names", [])),
         )
+
+
+class DirectionEstimator(str, Enum):
+    # The difference of the means of the two prompt sets (upstream).
+    MEAN_DIFF = "mean_diff"
+    # That difference corrected by the spread of the per-pair differences (LDA-like).
+    WHITENED = "whitened"
+
+
+class ExtraDirectionSource(str, Enum):
+    # Prototypes of a self-organizing map over the bad residuals (v5).
+    SOM = "som"
+    # Singular vectors of the per-pair differences; needs paired prompt sets.
+    PAIRED_SVD = "paired_svd"
 
 
 class RowNormalization(str, Enum):
@@ -322,6 +339,41 @@ class Settings(BaseModel):
         ),
     )
 
+    # Statistics over counterfactual pairs (fork addition). refusal-eval's train/bad_train
+    # and train/good_train are twins at the same index (same language, same technical
+    # terms, same opening words, same final punctuation), so everything but the refusal
+    # cancels inside a pair.
+    direction_estimator: DirectionEstimator = Field(
+        default=DirectionEstimator.MEAN_DIFF,
+        description=(
+            'How the classic direction of a layer is estimated. "mean_diff": the difference of '
+            'the means of the two prompt sets (upstream). "whitened": that difference corrected '
+            "by the covariance of the per-pair differences (LDA-like; the mean difference treats "
+            "every axis alike, although the pairs vary far more along some of them). The pairs "
+            "are the prompts at the same index, so both sets need the same length."
+        ),
+    )
+
+    whitening_shrinkage: float = Field(
+        default=0.1,
+        description=(
+            "Ridge of the whitening, as a fraction of the mean eigenvalue of the covariance. "
+            "There are fewer pairs than dimensions, so the covariance is singular and a ridge "
+            "is required; a larger value moves the direction back towards mean_diff."
+        ),
+    )
+
+    extra_direction_source: ExtraDirectionSource = Field(
+        default=ExtraDirectionSource.SOM,
+        description=(
+            'Source of the additional directions when direction_count > 1. "som": prototypes of '
+            'a self-organizing map over the bad residuals (arXiv 2511.08379). "paired_svd": the '
+            "singular vectors of the per-pair differences, i.e. the directions along which the "
+            "pairs differ most beyond their mean, already cleaned of language and topic by the "
+            "pairing. Needs prompt sets of the same length."
+        ),
+    )
+
     # Multi-directional abliteration with self-organizing maps (fork addition, upstream #140).
     direction_count: PositiveInt = Field(
         default=1,
@@ -484,6 +536,12 @@ class Settings(BaseModel):
         description="Clip of |log(p_bad / p_good)| per expert, so that rarely used experts do not get extreme biases.",
     )
 
+    @field_validator("whitening_shrinkage")
+    @classmethod
+    def validate_whitening_shrinkage(cls, value: float) -> float:
+        check_range("whitening_shrinkage", (value, value), strictly_positive=True)
+        return value
+
     @field_validator("direction_weight_range", "router_bias_alpha_range")
     @classmethod
     def validate_fork_weight_ranges(
@@ -617,22 +675,79 @@ class Abliteration(Modifier[Parameters]):
         print()
         print("Calculating per-layer residual directions...")
 
-        print("* Obtaining residual mean for good prompts...")
-        good_means = model.get_residuals_mean(
-            good_prompts,
-            winsorization_quantile=self.settings.winsorization_quantile,
+        paired = self.settings.direction_estimator == DirectionEstimator.WHITENED or (
+            self.settings.direction_count > 1
+            and self.settings.extra_direction_source == ExtraDirectionSource.PAIRED_SVD
         )
-        print("* Obtaining residual mean for bad prompts...")
-        bad_means = model.get_residuals_mean(
-            bad_prompts,
-            winsorization_quantile=self.settings.winsorization_quantile,
-        )
+        differences: Tensor | None = None
+
+        if paired:
+            if len(bad_prompts) != len(good_prompts):
+                raise ValueError(
+                    f"{self.settings.direction_estimator.value} / "
+                    f"{self.settings.extra_direction_source.value} compare the prompts at the "
+                    f"same index, but there are {len(bad_prompts)} bad and "
+                    f"{len(good_prompts)} good prompts. Use paired sets (refusal-eval "
+                    "train/bad_train and train/good_train) or mean_diff / som."
+                )
+            print(
+                f"* Obtaining per-prompt residuals of {len(bad_prompts)} prompt pairs "
+                "(both sets are kept in memory)..."
+            )
+            languages = sum(
+                detect_lang(bad.user) == detect_lang(good.user)
+                for bad, good in zip(bad_prompts, good_prompts)
+            )
+            print(
+                f"  * Pairs whose two prompts share a language: [bold]{languages}[/]"
+                f"/{len(bad_prompts)}"
+            )
+            bad_residuals = model.get_residuals_batched(
+                bad_prompts,
+                winsorization_quantile=self.settings.winsorization_quantile,
+            ).cpu()
+            good_residuals = model.get_residuals_batched(
+                good_prompts,
+                winsorization_quantile=self.settings.winsorization_quantile,
+            ).cpu()
+            differences = paired_differences(bad_residuals, good_residuals)
+            good_means = good_residuals.mean(dim=0)
+            bad_means = bad_residuals.mean(dim=0)
+            del bad_residuals, good_residuals
+        else:
+            print("* Obtaining residual mean for good prompts...")
+            good_means = model.get_residuals_mean(
+                good_prompts,
+                winsorization_quantile=self.settings.winsorization_quantile,
+            )
+            print("* Obtaining residual mean for bad prompts...")
+            bad_means = model.get_residuals_mean(
+                bad_prompts,
+                winsorization_quantile=self.settings.winsorization_quantile,
+            )
 
         self.residual_directions = F.normalize(
             bad_means - good_means,
             p=2,
             dim=1,
         )
+
+        if self.settings.direction_estimator == DirectionEstimator.WHITENED:
+            assert differences is not None
+            print(
+                "* Whitening the directions with the covariance of the pair differences "
+                f"(ridge {self.settings.whitening_shrinkage})..."
+            )
+            self.residual_directions = torch.stack(
+                [
+                    whiten(
+                        self.residual_directions[row],
+                        differences[:, row, :],
+                        self.settings.whitening_shrinkage,
+                    )
+                    for row in range(self.residual_directions.shape[0])
+                ]
+            )
 
         if self.settings.orthogonalize_direction:
             # Implements https://huggingface.co/blog/grimjim/projected-abliteration
@@ -661,7 +776,28 @@ class Abliteration(Modifier[Parameters]):
         # (row, slot, hidden), one slot per direction with its own weight.
         self.extra_directions = None
         self.extra_direction_names = ()
-        if self.settings.direction_count > 1:
+        if (
+            self.settings.direction_count > 1
+            and self.settings.extra_direction_source == ExtraDirectionSource.PAIRED_SVD
+        ):
+            assert differences is not None
+            print(
+                f"* Taking [bold]{self.settings.direction_count - 1}[/] additional directions "
+                "from the singular vectors of the pair differences..."
+            )
+            for index in range(self.settings.direction_count - 1):
+                slot = torch.stack(
+                    [
+                        paired_svd_directions(differences[:, row, :], index + 1)[index]
+                        for row in range(self.residual_directions.shape[0])
+                    ]
+                )
+                self._add_extra_direction(
+                    f"direction_{index + 1}",
+                    slot.to(self.residual_directions.device),
+                    good_means,
+                )
+        elif self.settings.direction_count > 1:
             print(
                 f"* Fitting self-organizing maps for [bold]{self.settings.direction_count - 1}[/] "
                 "additional directions per layer..."

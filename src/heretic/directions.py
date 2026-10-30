@@ -169,3 +169,81 @@ def interpolate_extras(extras: Tensor, direction_index: float, main: Tensor) -> 
     )
     result[: extension.shape[0]] = extension
     return result
+
+
+def paired_differences(bad_residuals: Tensor, good_residuals: Tensor) -> Tensor:
+    """
+    The per-pair difference of the residuals, (pair, row, hidden), for prompt sets whose
+    entries are counterfactual twins at the same index (refusal-eval train/bad_train and
+    train/good_train are built that way: same language, same technical terms, same opening
+    words, same final punctuation). Everything but the refusal cancels inside a row, which
+    the mean of the two sets cannot do.
+
+    The MEAN of these differences equals the difference of the means, so the classic
+    direction does not change; what changes is everything computed from the spread of the
+    differences (whitening, singular directions).
+    """
+    if bad_residuals.shape != good_residuals.shape:
+        raise ValueError(
+            "Paired statistics need the same number of bad and good prompts, in the same "
+            f"order, but their residuals have shapes {tuple(bad_residuals.shape)} and "
+            f"{tuple(good_residuals.shape)}"
+        )
+    return bad_residuals - good_residuals
+
+
+def whiten(direction: Tensor, differences: Tensor, shrinkage: float = 0.1) -> Tensor:
+    """
+    The unit direction `Sigma^-1/2 d` of one residual row, where Sigma is the covariance of
+    `differences` (pair, hidden) plus a ridge, i.e. the mean-difference direction corrected
+    for how much the differences actually vary along each axis (LDA / "whitened diff").
+
+    With fewer pairs than dimensions Sigma is singular, so a ridge of `shrinkage` times its
+    mean eigenvalue is added. The result is computed from the thin SVD of `differences`
+    (pairs x hidden), never from a hidden x hidden matrix: inside the span of the pairs the
+    component is scaled by (s^2 / n + lambda)^-1/2, outside it by lambda^-1/2.
+    """
+    pairs, hidden = differences.shape
+    if pairs < 2:
+        return F.normalize(direction, p=2, dim=0)
+
+    data = differences.to(torch.float64)
+    data = data - data.mean(dim=0, keepdim=True)
+    values = torch.linalg.svdvals(data)
+    variances = values**2 / max(pairs - 1, 1)
+    # The ridge is relative to the mean eigenvalue over the whole space, so it does not
+    # depend on how the scale of the residuals is measured.
+    ridge = shrinkage * float(variances.sum()) / hidden
+    if ridge <= 0:
+        return F.normalize(direction, p=2, dim=0)
+
+    _, _, basis = torch.linalg.svd(data, full_matrices=False)
+    vector = direction.to(torch.float64)
+    inside = basis @ vector
+    scales = (variances[: basis.shape[0]] + ridge).rsqrt() - ridge**-0.5
+    whitened = basis.T @ (scales * inside) + vector * ridge**-0.5
+    return F.normalize(whitened.to(direction.dtype), p=2, dim=0)
+
+
+def paired_svd_directions(differences: Tensor, count: int) -> Tensor:
+    """
+    The top `count` right singular vectors of the centered paired differences of one
+    residual row, (count, hidden): the directions along which the pairs differ most beyond
+    their mean. Rows that do not exist (fewer pairs than `count`) are zero.
+
+    These replace the self-organizing map as the source of the additional directions when
+    the prompt sets are paired: a cluster of the SOM is a group of harmful prompts, while a
+    singular vector of the differences is a direction of refusal that the pairing has
+    already cleaned of language and topic.
+    """
+    pairs, hidden = differences.shape
+    result = torch.zeros(count, hidden, dtype=differences.dtype)
+    if pairs < 2 or count == 0:
+        return result
+
+    data = differences.to(torch.float64)
+    data = data - data.mean(dim=0, keepdim=True)
+    _, _, basis = torch.linalg.svd(data, full_matrices=False)
+    available = min(count, basis.shape[0])
+    result[:available] = basis[:available].to(differences.dtype)
+    return result

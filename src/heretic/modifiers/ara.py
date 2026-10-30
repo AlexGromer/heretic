@@ -6,6 +6,7 @@
 
 import math
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any, Literal, cast
 
 import bitsandbytes.functional as BNB_F
@@ -29,7 +30,14 @@ from heretic.model import Model
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.positions import append_module_io, load_answer_items, module_io_means
 from heretic.ranges import check_range, scaled_floor
-from heretic.utils import format_dataset_specification, print
+from heretic.utils import detect_lang, format_dataset_specification, print
+
+
+class Pairing(str, Enum):
+    # Each bad output is pulled towards its k nearest good outputs (upstream).
+    KNN = "knn"
+    # Each bad output is pulled towards the good output at the same index (its twin).
+    INDEX = "index"
 
 
 @dataclass
@@ -40,6 +48,8 @@ class Parameters(Serializable):
     steer_bad_behavior_weight: float
     overcorrect_relative_weight: float
     neighbor_count: int
+    # "knn" (upstream) or "index" (fork addition); stored so a trial restores its own mode.
+    pairing: str = Pairing.KNN.value
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -116,6 +126,18 @@ class Settings(BaseModel):
     print_loss: bool = Field(
         default=False,
         description="Whether to print the loss value for each L-BFGS optimization step.",
+    )
+
+    pairing: Pairing = Field(
+        default=Pairing.KNN,
+        description=(
+            'How a bad output finds its target. "knn": the neighbor_count nearest good outputs '
+            '(upstream). "index": the good output at the SAME index, i.e. the counterfactual '
+            "twin of that request (refusal-eval train/bad_train and train/good_train are built "
+            "that way). The twin differs from its bad prompt only in the refusal, so the target "
+            "is exact instead of an average of unrelated requests, and neighbor_count is then "
+            "unused. Both prompt sets must have the same length and order."
+        ),
     )
 
     # Judged answers whose module I/O is added to the prompt I/O (fork addition, see
@@ -262,6 +284,30 @@ def mean_distances_to_knn(a: Tensor, b: Tensor, k: int) -> Tensor:
     return nearest_distances.mean(1)
 
 
+def distances_to_twin(a: Tensor, b: Tensor) -> Tensor:
+    """
+    The distance of every vector in `a` to the vector at the same index in `b` (fork
+    addition). With counterfactual pairs (refusal-eval train/bad_train and
+    train/good_train are twins at the same index) this is the distance to the safe version
+    of the very same request, instead of to an average of k unrelated safe requests.
+    """
+    if a.shape != b.shape:
+        raise ValueError(
+            f"Index pairing needs matching rows, got {tuple(a.shape)} and {tuple(b.shape)}"
+        )
+    return (a - b).norm(dim=1)
+
+
+def steering_distances(
+    new_bad_output: Tensor,
+    target: Tensor,
+    parameters: Parameters,
+) -> Tensor:
+    if parameters.pairing == Pairing.INDEX.value:
+        return distances_to_twin(new_bad_output, target)
+    return mean_distances_to_knn(new_bad_output, target, parameters.neighbor_count)
+
+
 def lowrank_frobenius_sq(A: Tensor, B: Tensor) -> Tensor:
     """
     ||B @ A||_F^2 = trace((B^T B) (A A^T)), computed from two rank x rank matrices
@@ -284,10 +330,10 @@ def ara_loss(
     steer_bad_behavior = (
         # Pull the outputs for "bad" prompts towards
         # the original outputs for "good" prompts.
-        mean_distances_to_knn(
+        steering_distances(
             new_bad_output,
             good_output,
-            parameters.neighbor_count,
+            parameters,
         ).mean()
         # Push the outputs for "bad" prompts away from
         # the original outputs for "bad" prompts.
@@ -296,10 +342,10 @@ def ara_loss(
         # in stronger steering that can overcome more complex
         # refusal mechanisms.
         + parameters.overcorrect_relative_weight
-        * -mean_distances_to_knn(
+        * -steering_distances(
             new_bad_output,
             bad_output,
-            parameters.neighbor_count,
+            parameters,
         ).mean()
     )
 
@@ -355,6 +401,23 @@ class ARA(Modifier[Parameters]):
         bad_prompts = ctx.load_prompts(self.settings.bad_prompts)
         print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 
+        if self.settings.pairing == Pairing.INDEX:
+            if len(bad_prompts) != len(good_prompts):
+                raise ValueError(
+                    'pairing = "index" compares the prompts at the same index, but there are '
+                    f"{len(bad_prompts)} bad and {len(good_prompts)} good prompts. Use paired "
+                    'sets (refusal-eval train/bad_train and train/good_train) or pairing = "knn".'
+                )
+            languages = sum(
+                detect_lang(bad.user) == detect_lang(good.user)
+                for bad, good in zip(bad_prompts, good_prompts)
+            )
+            print()
+            print(
+                f"* Index pairing: [bold]{len(bad_prompts)}[/] pairs, "
+                f"[bold]{languages}[/] of them with the same language on both sides"
+            )
+
         fused_experts_warning = get_fused_experts_warning(model)
         if fused_experts_warning is not None:
             print()
@@ -396,6 +459,14 @@ class ARA(Modifier[Parameters]):
             )
             self.bad_prompt_count += len(bad_items)
             self.good_prompt_count += len(good_items)
+            if self.settings.pairing == Pairing.INDEX and len(bad_items) != len(
+                good_items
+            ):
+                raise ValueError(
+                    'pairing = "index" needs the same number of rows on both sides, but the '
+                    f"judged answers added {len(bad_items)} bad and {len(good_items)} good "
+                    'ones. Use pairing = "knn" with judged answers, or add equally many.'
+                )
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -472,6 +543,7 @@ class ARA(Modifier[Parameters]):
             steer_bad_behavior_weight=steer_bad_behavior_weight,
             overcorrect_relative_weight=overcorrect_relative_weight,
             neighbor_count=neighbor_count,
+            pairing=self.settings.pairing.value,
         )
 
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:

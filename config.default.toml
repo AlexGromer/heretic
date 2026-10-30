@@ -506,6 +506,13 @@ overcorrect_range = [0.0, 1.3]
 # Upper bound of the number of nearest neighbors (also limited by the number of prompts).
 neighbor_count_max = 15
 
+# How a bad output finds its target (fork addition). "knn": the neighbor_count nearest good
+# outputs (upstream). "index": the good output at the SAME index, i.e. the counterfactual twin of
+# that request (refusal-eval train/bad_train and train/good_train are built that way). The twin
+# differs only in the refusal, so the target is exact instead of an average over unrelated
+# requests, and neighbor_count is unused. Both sets must have the same length and order.
+pairing = "knn"
+
 # Dataset of prompts that tend to produce desirable responses.
 [modifier.ARA.good_prompts]
 dataset = "mlabonne/harmless_alpaca"
@@ -577,6 +584,26 @@ ega_min_tokens = 2
 # "mean" (divided by the mean frequency of the used experts, capped at 1),
 # "none" (every used expert gets the full strength).
 ega_frequency_scaling = "max"
+
+# How the classic direction of a layer is estimated (fork addition). "mean_diff": the difference
+# of the means of the two prompt sets (upstream). "whitened": that difference corrected by the
+# covariance of the PER-PAIR differences, i.e. the axes along which the pairs barely vary count
+# for more (LDA-like). "whitened" needs paired prompt sets - the prompts at the same index must be
+# counterfactual twins, as refusal-eval's train/bad_train and train/good_train are (same language,
+# same technical terms, same opening words, same final punctuation), and both sets must have the
+# same length. It also keeps the per-prompt residuals of both sets in memory
+# (prompts * (layers + 1) * hidden * 4 bytes each).
+direction_estimator = "mean_diff"
+
+# Ridge of the whitening, as a fraction of the mean eigenvalue of the covariance (there are fewer
+# pairs than dimensions, so the covariance is singular). Larger moves back towards mean_diff.
+whitening_shrinkage = 0.1
+
+# Source of the additional directions when direction_count > 1. "som": prototypes of a
+# self-organizing map over the bad residuals (arXiv 2511.08379). "paired_svd": the singular vectors
+# of the per-pair differences, which the pairing has already cleaned of language and topic; needs
+# paired sets like "whitened" above.
+extra_direction_source = "som"
 
 # Number of refusal directions per layer (fork addition, upstream issue #140, "SOM Directions
 # are Better than One", arXiv 2511.08379). 1 is classic abliteration. With more, a

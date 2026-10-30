@@ -103,6 +103,10 @@ class ExampleConfigTests(unittest.TestCase):
                 "language_directions",
                 "language_min_prompts",
                 "router_bias_per_layer",
+                "direction_estimator",
+                "whitening_shrinkage",
+                "extra_direction_source",
+                "pairing",
                 "tokens",
                 "top_k",
             ):

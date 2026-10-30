@@ -529,3 +529,43 @@ study do not bring refusals down by themselves (#404).
 
 Not done here: wiring the two-stage selection, the new fork patch and `--trial-number` into
 heretic-colab-pipeline (that repository is being changed elsewhere).
+
+# v8: statistics over counterfactual pairs
+
+Branch `paired-directions`. refusal-eval's `train/bad_train` and `train/good_train` are
+counterfactual twins at the SAME index: 612 pairs, the same language on both sides in all of
+them, the same three technical terms in 522, the same opening words in 522 and the same final
+punctuation in 583. Inside a pair everything but the refusal cancels, which the mean of the two
+sets cannot do. Three settings use that; all default to the previous behaviour, and all of them
+require both sets to have the same length and order (an unpaired pair of sets is refused with a
+message naming the counts).
+
+Note what does **not** change: the mean of the per-pair differences is exactly the difference of
+the means, so the classic direction is the same whether the sets are paired or not (a test pins
+this). What the pairing buys is everything computed from the *spread* of the differences.
+
+* `[modifier.Abliteration] direction_estimator = "whitened"`: the mean-difference direction
+  corrected by the covariance of the per-pair differences (LDA-like, the "whitened diff" of the
+  representation-engineering literature). The plain difference treats every axis alike, although
+  the pairs vary far more along some of them; whitening favours the axes along which the pairs
+  barely vary, which is where a clean refusal signal sits. With fewer pairs than dimensions the
+  covariance is singular, so `whitening_shrinkage` (default 0.1 of the mean eigenvalue) is added;
+  a large value goes back to `mean_diff`. Computed from the thin SVD of the differences, never
+  from a hidden x hidden matrix. Cost: the per-prompt residuals of both sets are kept in memory
+  (`prompts * (layers + 1) * hidden * 4` bytes each).
+* `extra_direction_source = "paired_svd"`: the additional directions of `direction_count > 1` come
+  from the singular vectors of the per-pair differences instead of the self-organizing map. A SOM
+  cluster is a group of harmful prompts (so language and topic are still in it); a singular vector
+  of the differences is a direction of refusal the pairing has already cleaned.
+* `[modifier.ARA] pairing = "index"`: every bad output is pulled towards the good output at the
+  same index, its own counterfactual twin, instead of towards the mean of its `neighbor_count`
+  nearest good outputs. The twin is the safe version of the very same request, so the target is
+  exact rather than an average over unrelated requests; `neighbor_count` is then unused. With
+  `response_io_file` the judged answers must add equally many rows to both sides, or the run stops.
+
+The row of the embeddings has no direction under pairing (it holds the embedding of the last
+prompt token, which the pairing makes identical); Heretic never ablates that row, since a layer
+uses the row after it.
+
+Tests: `tests/test_v8.py`. Not run on a GPU or on a real model: whether a whitened direction or
+index pairing lowers refusals or KL is unmeasured.
