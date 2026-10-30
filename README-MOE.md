@@ -120,6 +120,8 @@ The fixed Optuna ranges of the modifiers are settings now, with the upstream val
 * `[modifier.Abliteration]`: `direction_index_range`, `max_weight_range`, `mlp_max_weight_range`,
   `max_weight_position_range`, `min_weight_range`, `min_weight_distance_min_layers`,
   `min_weight_distance_max_fraction`.
+  `direction_index_range` may end at 1.0 (the last layer): the global direction then is the direction
+  of the last layer, there is no row to interpolate with beyond it.
 * `[modifier.ARA]`: `start_layer_range`, `end_layer_range`, `preserve_good_weight_range`,
   `steer_bad_weight_range`, `overcorrect_range`, `neighbor_count_max`.
 

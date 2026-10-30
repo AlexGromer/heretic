@@ -9,10 +9,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import optuna
+import torch
+import torch.nn.functional as F
 from pydantic import ValidationError
 
 from heretic.modifier import Context
-from heretic.modifiers.abliteration import Abliteration
+from heretic.modifiers.abliteration import Abliteration, Parameters
 from heretic.modifiers.abliteration import Settings as AbliterationSettings
 from heretic.modifiers.ara import ARA
 from heretic.modifiers.ara import Settings as ARASettings
@@ -268,6 +270,75 @@ def test_invalid_range_rejected() -> None:
     # and a pinned range (low == high) is allowed.
     AbliterationSettings(mlp_max_weight_range=(-1.0, 1.0))
     AbliterationSettings(max_weight_range=(1.0, 1.0))
+
+
+class ModifyStubModel(StubModel):
+    # No fused experts and no LoRA modules: modify_model only resolves the global
+    # direction, which is where an out-of-range index would crash.
+    def get_layer_fused_experts(self, layer_index: int) -> dict[Any, Any]:
+        return {}
+
+    def get_layer_modules(self, layer_index: int) -> dict[Any, Any]:
+        return {}
+
+
+def make_modifier_with_directions(
+    settings: AbliterationSettings, seed: int
+) -> Abliteration:
+    # residual_directions has LAYER_COUNT + 1 rows (embeddings plus layers).
+    modifier = make_abliteration(settings)
+    modifier.residual_directions = F.normalize(
+        torch.randn(LAYER_COUNT + 1, 8, generator=torch.Generator().manual_seed(seed)),
+        dim=1,
+    )
+    return modifier
+
+
+def modify_context() -> Context:
+    return cast(Context, SimpleNamespace(get_model=lambda: ModifyStubModel()))
+
+
+class DirectionIndexBoundaryTests(unittest.TestCase):
+    def test_upper_bound_of_one_does_not_overrun(self) -> None:
+        # direction_index_range may end at 1.0, i.e. the last layer index. Upstream's
+        # fixed 0.9 never got there; the lerp must clamp to the last residual row.
+        modifier = make_modifier_with_directions(AbliterationSettings(), 0)
+        for index in (float(LAST_LAYER_INDEX), LAST_LAYER_INDEX - 1e-9, 0.0):
+            modifier.modify_model(
+                modify_context(),
+                Parameters(direction_index=index, weight_distributions={}),
+            )
+
+    def test_global_direction_at_upper_bound_is_last_row(self) -> None:
+        modifier = make_modifier_with_directions(AbliterationSettings(), 1)
+        directions = modifier.residual_directions
+        direction = modifier.global_residual_direction(float(LAST_LAYER_INDEX))
+        self.assertTrue(torch.allclose(direction, directions[-1], atol=1e-6))
+        # An interior index is unchanged: halfway between layer 3 and 4 interpolates
+        # the rows 4 and 5 (row 0 is the embeddings).
+        direction = modifier.global_residual_direction(3.5)
+        expected = F.normalize(directions[4].lerp(directions[5], 0.5), dim=0)
+        self.assertTrue(torch.allclose(direction, expected, atol=1e-6))
+
+    def test_pinned_upper_bound_samples_and_modifies(self) -> None:
+        modifier = make_modifier_with_directions(
+            AbliterationSettings(direction_index_range=(1.0, 1.0)), 2
+        )
+        # direction_scope is sampled; pick the trials that use the global direction.
+        sampled = [
+            Parameters.from_dict(trial.user_attrs["parameters"])
+            for trial in sample(modifier, count=20)
+        ]
+        global_scope = [
+            parameters
+            for parameters in sampled
+            if isinstance(parameters, Parameters)
+            and parameters.direction_index is not None
+        ]
+        self.assertTrue(global_scope)
+        for parameters in global_scope:
+            self.assertEqual(parameters.direction_index, float(LAST_LAYER_INDEX))
+            modifier.modify_model(modify_context(), parameters)
 
 
 if __name__ == "__main__":

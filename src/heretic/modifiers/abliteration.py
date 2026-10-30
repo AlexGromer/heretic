@@ -566,22 +566,36 @@ class Abliteration(Modifier[Parameters]):
             weight_distributions=weight_distributions,
         )
 
+    def global_residual_direction(self, direction_index: float) -> Tensor:
+        # The index must be shifted by 1 because the first element
+        # of residual_directions is the direction for the embeddings.
+        weight, index = math.modf(direction_index + 1)
+        index = int(index)
+
+        # The configurable direction_index_range may reach 1.0, i.e. the index of the
+        # last layer (upstream's fixed range stopped at 0.9). Then there is no row
+        # after the last one to interpolate with, so use the last row itself.
+        last_row = len(self.residual_directions) - 1
+        if index >= last_row:
+            index, weight = last_row - 1, 1.0
+
+        return F.normalize(
+            self.residual_directions[index].lerp(
+                self.residual_directions[index + 1],
+                weight,
+            ),
+            p=2,
+            dim=0,
+        )
+
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
 
         if parameters.direction_index is None:
             residual_direction = None
         else:
-            # The index must be shifted by 1 because the first element
-            # of residual_directions is the direction for the embeddings.
-            weight, index = math.modf(parameters.direction_index + 1)
-            residual_direction = F.normalize(
-                self.residual_directions[int(index)].lerp(
-                    self.residual_directions[int(index) + 1],
-                    weight,
-                ),
-                p=2,
-                dim=0,
+            residual_direction = self.global_residual_direction(
+                parameters.direction_index
             )
 
         def get_layer_weight(layer_index: int, component: str) -> float | None:
