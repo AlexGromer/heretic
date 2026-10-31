@@ -93,18 +93,26 @@ def pool_trials(
     The trials the candidates of the generate mode are taken from. "front" (default) is
     `sorted_trials` as they are, the Pareto front in the order of the scores. "all" is every
     completed trial of the study, highest KL divergence first (the strongest edits, which are
-    the ones that remove non-answers the keyword scorer cannot see), ties by trial number,
-    trials without a KL score last. select_candidates then applies the cap and the count.
+    the ones that remove non-answers the keyword scorer cannot see), ties by trial number.
+    A completed trial without a KL score is left out: the KL cap cannot be applied to it.
+    select_candidates then applies the cap and the count.
     """
     if pool != "all":
         return sorted_trials
     from optuna.trial import TrialState
 
-    def order(trial: FrozenTrial) -> tuple[bool, float, int]:
+    def order(trial: FrozenTrial) -> tuple[float, int]:
         kl = score_value(trial, KL_NAME)
-        return (kl is None, -(kl or 0.0), trial.user_attrs.get("index", trial.number))
+        return (-(kl or 0.0), trial.user_attrs.get("index", trial.number))
 
-    return sorted(study.get_trials(states=(TrialState.COMPLETE,)), key=order)
+    return sorted(
+        (
+            trial
+            for trial in study.get_trials(states=(TrialState.COMPLETE,))
+            if score_value(trial, KL_NAME) is not None
+        ),
+        key=order,
+    )
 
 
 def category_rates(

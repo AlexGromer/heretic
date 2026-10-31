@@ -465,7 +465,7 @@ class PoolTests(unittest.TestCase):
         # FAIL and RUNNING trials are not candidates; ties in KL go to the lower index
         self.assertEqual([t.user_attrs["index"] for t in pool], [1, 2, 3, 5, 4])
 
-    def test_a_trial_without_a_kl_score_comes_last(self) -> None:
+    def test_a_trial_without_a_kl_score_is_not_a_candidate(self) -> None:
         study = optuna.create_study(directions=["minimize"])
         for index, kl in ((1, None), (2, 0.2)):
             scores = [{"name": "Refusals", "score": {"value": 0.1}}]
@@ -480,7 +480,8 @@ class PoolTests(unittest.TestCase):
                 )
             )
         pool = pool_trials(study, [], "all")
-        self.assertEqual([t.user_attrs["index"] for t in pool], [2, 1])
+        # its KL is unknown, so the KL cap cannot be applied to it: it is left out, not ranked last
+        self.assertEqual([t.user_attrs["index"] for t in pool], [2])
 
     def test_the_kl_cap_and_the_count_pick_the_strongest_within_the_cap(self) -> None:
         study = self.make_study()
