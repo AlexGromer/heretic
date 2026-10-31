@@ -22,6 +22,7 @@ from optuna.trial import create_trial
 from heretic.config import Settings
 from heretic.judge_ranking import (
     load_ranking_prompts,
+    pool_trials,
     response_key,
     select_trial_by_number,
     write_candidate_answers,
@@ -401,6 +402,124 @@ class DpoJoinTests(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0]["prompt"][0], {"role": "system", "content": "S"})
         self.assertEqual(pairs[0]["rejected"][0]["content"], "vague")
+
+
+class PoolTests(unittest.TestCase):
+    """
+    judge_ranking_pool = "all": the candidates of the generate mode come from every completed
+    trial within judge_ranking_max_kl, strongest edits (highest KL divergence) first, instead of
+    the keyword Pareto front. A trial off the front can have fewer non-answers than the keywords
+    can see, so the front alone is a ceiling for the judge.
+    """
+
+    @staticmethod
+    def make_study() -> optuna.Study:
+        study = optuna.create_study(directions=["minimize", "minimize"])
+        distributions = {"x": FloatDistribution(0.0, 1.0)}
+
+        def add(
+            index: int,
+            refusals: float,
+            kl: float | None,
+            state: optuna.trial.TrialState = optuna.trial.TrialState.COMPLETE,
+        ) -> None:
+            scores = [{"name": "Refusals", "score": {"value": refusals}}]
+            if kl is not None:
+                scores.append({"name": "KL divergence", "score": {"value": kl}})
+            study.add_trial(
+                create_trial(
+                    state=state,
+                    values=(
+                        [refusals, kl if kl is not None else 0.0]
+                        if state == optuna.trial.TrialState.COMPLETE
+                        else None
+                    ),
+                    params={"x": 0.5},
+                    distributions=distributions,
+                    user_attrs={"index": index, "parameters": {"p": index}, "scores": scores},
+                )
+            )
+
+        add(1, 0.0, 0.40)  # on the front
+        add(2, 0.2, 0.30)  # dominated by trial 3 (fewer refusals, same KL)
+        add(3, 0.1, 0.30)  # on the front
+        add(4, 0.5, 0.01)  # on the front (lowest KL)
+        add(5, 0.3, 0.30)  # same KL as 2 and 3: the lower index first
+        add(6, 0.0, 0.0, state=optuna.trial.TrialState.FAIL)
+        study.ask()  # a trial that was running when the runtime died
+        return study
+
+    def test_the_front_is_the_default_and_stays_as_it_is(self) -> None:
+        study = self.make_study()
+        front = sorted(study.best_trials, key=lambda t: t.values)
+        self.assertIs(pool_trials(study, front, "front"), front)
+        self.assertEqual(
+            Settings.model_fields["judge_ranking_pool"].default, "front"
+        )
+        self.assertTrue(Settings.model_fields["judge_ranking_pool"].exclude)
+
+    def test_all_completed_trials_by_kl_descending(self) -> None:
+        study = self.make_study()
+        front = sorted(study.best_trials, key=lambda t: t.values)
+        pool = pool_trials(study, front, "all")
+        # FAIL and RUNNING trials are not candidates; ties in KL go to the lower index
+        self.assertEqual([t.user_attrs["index"] for t in pool], [1, 2, 3, 5, 4])
+
+    def test_a_trial_without_a_kl_score_comes_last(self) -> None:
+        study = optuna.create_study(directions=["minimize"])
+        for index, kl in ((1, None), (2, 0.2)):
+            scores = [{"name": "Refusals", "score": {"value": 0.1}}]
+            if kl is not None:
+                scores.append({"name": "KL divergence", "score": {"value": kl}})
+            study.add_trial(
+                create_trial(
+                    values=[0.1],
+                    params={"x": 0.5},
+                    distributions={"x": FloatDistribution(0.0, 1.0)},
+                    user_attrs={"index": index, "parameters": {}, "scores": scores},
+                )
+            )
+        pool = pool_trials(study, [], "all")
+        self.assertEqual([t.user_attrs["index"] for t in pool], [2, 1])
+
+    def test_the_kl_cap_and_the_count_pick_the_strongest_within_the_cap(self) -> None:
+        study = self.make_study()
+        front = sorted(study.best_trials, key=lambda t: t.values)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = handoff_settings(
+                directory, judge_ranking_max_kl=0.35, n_judge_ranking_trials=2
+            )
+            modifier = FakeModifier()
+            generated: list[Any] = []
+
+            class FakeModel:
+                tokenizer = FakeTokenizer()
+
+                def get_responses_batched(
+                    self, prompts: Any, skip_special_tokens: bool
+                ) -> list[str]:
+                    generated.append(modifier.modified)
+                    return ["a" for _ in prompts]
+
+            with redirect_stdout(io.StringIO()):
+                write_candidate_answers(
+                    pool_trials(study, front, "all"),
+                    settings,
+                    cast(Any, FakeModel()),
+                    cast(Any, modifier),
+                )
+        # trial 1 (KL 0.40) is over the cap; of the rest the two strongest edits, base first.
+        # The front alone would have given 3 and 4.
+        self.assertEqual(generated, [None, 2, 3])
+
+    def test_the_pool_comes_from_this_run_not_from_the_study(self) -> None:
+        stored = dict(ResumedSettingsTests.STORED)
+        settings = Settings.model_validate_init_only(
+            stored, Settings.model_construct(judge_ranking_pool="all")
+        )
+        self.assertEqual(settings.judge_ranking_pool, "all")
+        dumped = json.loads(Settings.model_construct(model="m").model_dump_json())
+        self.assertNotIn("judge_ranking_pool", dumped)
 
 
 class TrialNumberTests(unittest.TestCase):

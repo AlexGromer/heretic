@@ -127,6 +127,11 @@ n_merged_score_trials = 0
 n_judge_ranking_trials = 0
 judge_ranking_max_kl = 0.15
 
+# Where the candidates of the "generate" mode come from. "front": the Pareto front. "all": every
+# completed trial within judge_ranking_max_kl, highest KL divergence first (the strongest edits),
+# so a trial the keyword scorer rated worse than the front can still be judged.
+judge_ranking_pool = "front"
+
 # "judge": judge here via the judge endpoint. "generate": only write the answers of the original
 # model ("base") and the ranked trials to judge_ranking_output in the harness's responses.jsonl
 # format (keys already there are skipped), for judging in a separate process such as

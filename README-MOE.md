@@ -431,6 +431,10 @@ model (e.g. the harness's judge process); how a pipeline uses this is the pipeli
   resumes. Without a terminal, Heretic exits after writing. Prompts:
   `judge_ranking_prompts_file` (JSON Lines with id, category, prompt, e.g.
   `train/bad_eval.meta.jsonl`), set name `judge_ranking_set`, model label `judge_ranking_model_name`.
+* `judge_ranking_pool = "all"` (default `"front"`): in the `generate` mode the candidates are taken
+  from every completed trial within `judge_ranking_max_kl`, highest KL divergence first (ties by
+  trial number), not only from the Pareto front, because the keyword scorer cannot see the
+  non-answers without refusal words that decide whether a trial off the front is better.
 * `judge_ranking_merged = true` (default): each ranked trial is merged into the weights in memory
   before its answers are generated, so they come from the same weights an export contains (the
   live LoRA rounds differently, upstream #490). One model reload per trial, no export to disk.

@@ -559,6 +559,18 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    judge_ranking_pool: Literal["front", "all"] = Field(
+        default="front",
+        description=(
+            'Where the candidates of the "generate" judge ranking mode come from. "front": the '
+            'Pareto front, as for the other modes. "all": every completed trial of the study '
+            "within judge_ranking_max_kl, highest KL divergence first, so trials the keyword "
+            "scorer rated worse than the front (it cannot see non-answers without refusal words) "
+            "can still be judged. n_judge_ranking_trials is the number of candidates."
+        ),
+        exclude=True,
+    )
+
     judge_ranking_response_length: PositiveInt = Field(
         default=512,
         description=(

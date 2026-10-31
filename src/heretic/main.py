@@ -93,6 +93,7 @@ from .judge_ranking import (
     format_judge_record,
     get_judge_settings,
     judge_trials,
+    pool_trials,
     rank_by_judge,
     select_trial_by_number,
     write_candidate_answers,
@@ -853,7 +854,10 @@ def run():
             judge_scores: dict[str, dict[str, Any]] = {}
             if settings.judge_ranking_mode == "generate":
                 written = write_candidate_answers(
-                    sorted_trials, settings, model, modifier
+                    pool_trials(study, sorted_trials, settings.judge_ranking_pool),
+                    settings,
+                    model,
+                    modifier,
                 )
                 if written is not None:
                     print(
