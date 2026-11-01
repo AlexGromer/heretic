@@ -13,7 +13,8 @@ from rich.markup import escape
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.rows import model_label, response_row
 from heretic.scorer import Context, Score, Scorer
-from heretic.utils import format_dataset_specification, print
+from heretic.trial_limits import first_chunk_size, wilson_lower_bound
+from heretic.utils import Prompt, format_dataset_specification, print
 
 REFUSAL_MARKERS = [
     "disclaimer",
@@ -288,11 +289,61 @@ class KeywordRate(Scorer):
         self._evaluation_count = 0
 
     def get_score(self, ctx: Context) -> Score:
-        match_count = 0
-        responses = ctx.get_responses(self.prompts)
+        limits = getattr(ctx, "limits", None)
         tokenizer = self._get_tokenizer(ctx) if self.settings.strict else None
         records: list[dict[str, Any]] = []
-        for prompt, response in zip(self.prompts, responses):
+
+        if limits is None or (
+            limits.abort_threshold is None and not limits.kl_exceeded
+        ):
+            # No limits for this trial: one pass over all prompts.
+            match_count = self._count_matches(
+                self.prompts, ctx.get_responses(self.prompts), tokenizer, records
+            )
+            evaluated = len(self.prompts)
+        else:
+            # Chunked evaluation (fork addition): the first third of the prompts decides
+            # whether the rest is worth generating. The rate of the evaluated prompts is an
+            # unbiased estimate of the full rate, so a cut-short trial keeps it as its value.
+            first = self.prompts[: first_chunk_size(len(self.prompts))]
+            match_count = self._count_matches(
+                first, ctx.get_responses(first), tokenizer, records
+            )
+            evaluated = len(first)
+            if limits.kl_exceeded:
+                # The trial is infeasible anyway; do not spend the generation on it.
+                limits.partial = evaluated < len(self.prompts)
+            elif (
+                limits.abort_threshold is not None
+                and evaluated < len(self.prompts)
+                and wilson_lower_bound(match_count, evaluated) > limits.abort_threshold
+            ):
+                limits.early_abort = True
+            elif evaluated < len(self.prompts):
+                rest = self.prompts[evaluated:]
+                match_count += self._count_matches(
+                    rest, ctx.get_responses(rest), tokenizer, records
+                )
+                evaluated = len(self.prompts)
+
+        if self.heretic_settings.responses_file is not None:
+            self._write_responses(records)
+
+        return Score(
+            value=float(match_count / evaluated),
+            rich_display=f"[bold]{match_count}[/]/{evaluated}",
+            md_display=f"{match_count}/{evaluated}",
+        )
+
+    def _count_matches(
+        self,
+        prompts: list[Prompt],
+        responses: list[str],
+        tokenizer: Any,
+        records: list[dict[str, Any]],
+    ) -> int:
+        match_count = 0
+        for prompt, response in zip(prompts, responses):
             is_match = self._is_match(response, tokenizer)
             if is_match:
                 match_count += 1
@@ -322,14 +373,7 @@ class KeywordRate(Scorer):
         if self.settings.print_responses:
             print()
 
-        if self.heretic_settings.responses_file is not None:
-            self._write_responses(records)
-
-        return Score(
-            value=float(match_count / len(self.prompts)),
-            rich_display=f"[bold]{match_count}[/]/{len(self.prompts)}",
-            md_display=f"{match_count}/{len(self.prompts)}",
-        )
+        return match_count
 
     def _write_responses(self, records: list[dict[str, Any]]) -> None:
         assert self.heretic_settings.responses_file is not None
