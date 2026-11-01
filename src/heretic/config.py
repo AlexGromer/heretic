@@ -451,6 +451,29 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    kl_constraint: float | None = Field(
+        default=None,
+        description=(
+            "Upper limit of the KL divergence. If set, a trial above it is infeasible: the sampler "
+            "(Optuna's constraints_func) searches the feasible zone only, and the refusal scorer "
+            "evaluates just the first third of its prompts for such a trial. A KL divergence scorer "
+            "must be configured. Unset: no constraint."
+        ),
+        exclude=True,
+    )
+
+    early_abort: bool = Field(
+        default=False,
+        description=(
+            "Whether to stop counting refusals of a trial after the first third of the prompts "
+            "if the one-sided Wilson lower bound of the refusal rate is above the median refusal "
+            "value of the finished feasible trials (inactive until 5 of them exist). The trial "
+            "keeps the rate of the evaluated prompts. Use it together with kl_constraint: without "
+            "a constraint, a trial with many refusals and a low KL divergence can still be Pareto-optimal."
+        ),
+        exclude=True,
+    )
+
     n_judge_ranking_trials: NonNegativeInt = Field(
         default=0,
         description=(

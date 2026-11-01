@@ -16,6 +16,7 @@ from torch import Tensor
 from .config import DatasetSpecification, SingleDatasetSpecification
 from .config import Settings as HereticSettings
 from .model import Model
+from .trial_limits import TrialLimits
 from .utils import Prompt, deep_merge_dicts, load_prompts
 
 T = TypeVar("T")
@@ -156,6 +157,9 @@ class Context:
     def __init__(self, settings: HereticSettings, model: Model) -> None:
         self._model = model
         self._settings = settings
+        # Limits of the running trial (KL constraint, early abort); set by the evaluator
+        # for the scorer they apply to, None otherwise.
+        self.limits: TrialLimits | None = None
         self._responses_cache: dict[tuple[tuple[str, str], ...], list[str]] = {}
 
     def _cache_key(self, prompts: list[Prompt]) -> tuple[tuple[str, str], ...]:
