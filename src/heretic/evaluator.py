@@ -11,6 +11,9 @@ from .config import DatasetSpecification, ScorerConfig, Settings
 from .model import Model
 from .plugin import Context, is_builtin_plugin, load_plugin
 from .scorer import Score, Scorer
+from .scorers.keyword_rate import KeywordRate
+from .scorers.kl_divergence import KLDivergence
+from .trial_limits import TrialLimits
 from .utils import parse_study_direction, print
 
 
@@ -138,17 +141,73 @@ class Evaluator:
             is_builtin_plugin(entry.config.plugin) for entry in self._scorer_entries
         )
 
-    def get_scores(self) -> list[tuple[str, Score]]:
+    def get_scores(self, limits: TrialLimits | None = None) -> list[tuple[str, Score]]:
         """
         Run all scorers and return their scores and names
+
+        With `limits` (KL constraint, early abort of the refusal counting), the KL scorers
+        run first, so that the refusal scorer knows whether the trial is already
+        infeasible; the result keeps the configured order. Without limits the scorers run
+        in the configured order and nothing else changes.
 
         Returns:
             List of `Score` from each scorer and its name.
         """
         ctx = Context(settings=self.settings, model=self.model)
-        return [
-            (entry.name, entry.scorer.get_score(ctx)) for entry in self._scorer_entries
-        ]
+        if limits is None:
+            return [
+                (entry.name, entry.scorer.get_score(ctx))
+                for entry in self._scorer_entries
+            ]
+
+        refusal_entry = self._refusal_entry()
+        order = sorted(
+            range(len(self._scorer_entries)),
+            key=lambda i: not isinstance(self._scorer_entries[i].scorer, KLDivergence),
+        )
+        results: dict[int, tuple[str, Score]] = {}
+        for i in order:
+            entry = self._scorer_entries[i]
+            # The limits apply to the refusal objective only.
+            ctx.limits = limits if entry is refusal_entry else None
+            score = entry.scorer.get_score(ctx)
+            results[i] = (entry.name, score)
+            if (
+                isinstance(entry.scorer, KLDivergence)
+                and limits.kl_constraint is not None
+                and score.value > limits.kl_constraint
+            ):
+                limits.kl_exceeded = True
+        ctx.limits = None
+        return [results[i] for i in range(len(self._scorer_entries))]
+
+    def _refusal_entry(self) -> ScorerEntry | None:
+        """The scorer the limits apply to: the first minimized keyword rate objective."""
+        for entry in self._objective_entries():
+            if isinstance(entry.scorer, KeywordRate) and (
+                parse_study_direction(entry.config.optimization)
+                == StudyDirection.MINIMIZE
+            ):
+                return entry
+        return None
+
+    def refusal_objective_index(self) -> int | None:
+        """Index of the refusal objective in the objective values, or None."""
+        refusal_entry = self._refusal_entry()
+        if refusal_entry is None:
+            return None
+        return self._objective_entries().index(refusal_entry)
+
+    def has_kl_scorer(self) -> bool:
+        return any(isinstance(e.scorer, KLDivergence) for e in self._scorer_entries)
+
+    def get_kl_value(self, scores: list[tuple[str, Score]]) -> float | None:
+        """The value of the first KL divergence scorer, or None if there is none."""
+        score_by_name = {name: score for name, score in scores}
+        for entry in self._scorer_entries:
+            if isinstance(entry.scorer, KLDivergence):
+                return score_by_name[entry.name].value
+        return None
 
     def get_baseline_scores(self) -> list[tuple[str, Score]]:
         """
