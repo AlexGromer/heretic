@@ -21,9 +21,11 @@ from heretic.scorer import Score
 from heretic.scorers.keyword_rate import KeywordRate, Settings
 from heretic.scorers.kl_divergence import KLDivergence
 from heretic.trial_limits import (
+    ABORT_QUANTILE,
     MIN_FEASIBLE_TRIALS,
     TrialLimits,
     abort_threshold,
+    kl_excess_of,
     build_sampler,
     first_chunk_size,
     make_trial_limits,
@@ -111,6 +113,60 @@ def test_constraints_func_survives_a_trial_without_kl_excess() -> None:
     assert second == [-0.2]
 
 
+def run_study_values(
+    rows: list[tuple[float | None, float]], kl_index: int | None
+) -> optuna.Study:
+    """rows: (kl_excess attribute or None, KL objective value) per trial."""
+    settings = make_settings(kl_constraint=0.5, early_abort=False)
+    study = optuna.create_study(
+        sampler=build_sampler(settings, kl_index),
+        directions=["minimize", "minimize"],
+    )
+    queue = list(rows)
+
+    def objective(trial: optuna.Trial) -> tuple[float, float]:
+        x = trial.suggest_float("x", 0.0, 1.0)
+        excess, kl = queue.pop(0)
+        if excess is not None:
+            trial.set_user_attr("kl_excess", excess)
+        return x, kl
+
+    study.optimize(objective, n_trials=len(rows))
+    return study
+
+
+def test_constraints_func_uses_the_kl_objective_value_when_the_attribute_is_missing() -> (
+    None
+):
+    # A journal of an older run (or a run without the limits) has no kl_excess, but the KL
+    # objective value is stored with the trial: excess = KL - limit.
+    study = run_study_values([(None, 0.8), (None, 0.2), (-0.4, 0.1)], kl_index=1)
+    stored = [list(t.system_attrs["constraints"]) for t in study.trials]
+    assert abs(stored[0][0] - 0.3) < 1e-12
+    assert abs(stored[1][0] - -0.3) < 1e-12
+    # The attribute wins over the objective value when both exist.
+    assert stored[2] == [-0.4]
+
+
+def test_constraints_func_without_a_kl_objective_stays_infeasible() -> None:
+    study = run_study_values([(None, 0.2)], kl_index=None)
+    assert list(study.trials[0].system_attrs["constraints"])[0] > 0
+
+
+def test_kl_excess_of() -> None:
+    trial = frozen(0.3, 0.8)
+    assert abs((kl_excess_of(trial, 0.5, 1) or 0.0) - 0.3) < 1e-12
+    assert kl_excess_of(trial, 0.5, None) is None
+    assert kl_excess_of(trial, 0.5, 7) is None  # index out of range
+    assert kl_excess_of(frozen(0.3, 0.8, kl_excess=-1.0), 0.5, 1) == -1.0
+    running = create_trial(
+        state=TrialState.RUNNING,
+        params={"x": 0.5},
+        distributions={"x": FloatDistribution(0.0, 1.0)},
+    )
+    assert kl_excess_of(running, 0.5, 1) is None
+
+
 # -------------------------------------------------------------- statistics
 
 
@@ -159,26 +215,50 @@ def test_threshold_inactive_while_fewer_than_five_feasible() -> None:
     assert abort_threshold(trials, 0, 0.5) is not None
 
 
-def test_threshold_is_the_median_of_completed_feasible_trials() -> None:
+def test_threshold_is_the_075_quantile_including_early_aborted_trials() -> None:
+    assert ABORT_QUANTILE == 0.75
     trials = [
         frozen(0.9, 0.1, kl_excess=-0.4),
         frozen(0.5, 0.1, kl_excess=-0.4),
         frozen(0.3, 0.1, kl_excess=-0.4),
         frozen(0.7, 0.1, kl_excess=0.0),  # on the limit is feasible
         frozen(0.1, 0.1, kl_excess=-0.4),
-        # Not counted: infeasible, partial, aborted, failed.
+        # Counted with its partial value: feasible, cut short by the abort.
+        frozen(0.8, 0.1, kl_excess=-0.4, early_abort=True),
+        # Not counted: infeasible, partial (KL above the limit), failed, pruned.
         frozen(0.0, 9.0, kl_excess=8.5),
         frozen(0.0, 0.1, kl_excess=-0.4, partial=True),
-        frozen(0.0, 0.1, kl_excess=-0.4, early_abort=True),
         frozen(0.0, 0.1, kl_excess=-0.4, state=TrialState.FAIL),
         frozen(0.0, 0.1, kl_excess=-0.4, state=TrialState.PRUNED),
     ]
-    assert abort_threshold(trials, 0, 0.5) == 0.5
+    # Sorted: .1 .3 .5 .7 .8 .9; the 0.75 quantile sits at index 3.75 -> 0.7 + 0.75 * 0.1.
+    threshold = abort_threshold(trials, 0, 0.5)
+    assert threshold is not None and abs(threshold - 0.775) < 1e-12
+    # Without the early-aborted trial: .1 .3 .5 .7 .9, index 3.0 -> 0.7 (the median was 0.5).
+    threshold = abort_threshold([t for t in trials if not t.user_attrs.get("early_abort")], 0, 0.5)
+    assert threshold is not None and abs(threshold - 0.7) < 1e-12
 
 
 def test_threshold_without_kl_constraint_counts_every_full_trial() -> None:
     trials = [frozen(r, 0.1) for r in (0.1, 0.2, 0.3, 0.4, 0.5)]
-    assert abort_threshold(trials, 0, None) == 0.3
+    threshold = abort_threshold(trials, 0, None)
+    assert threshold is not None and abs(threshold - 0.4) < 1e-12
+
+
+def test_threshold_takes_the_feasibility_of_old_trials_from_the_kl_value() -> None:
+    # Trials without kl_excess (an older journal): feasible when the KL objective value
+    # (index 1) is within the limit; unknown without a KL objective index.
+    old = [frozen(r, 0.1) for r in (0.1, 0.2, 0.3, 0.4, 0.5)]
+    old.append(frozen(0.99, 0.9))  # KL above the limit: infeasible
+    threshold = abort_threshold(old, 0, 0.5, kl_index=1)
+    assert threshold is not None and abs(threshold - 0.4) < 1e-12
+    assert abort_threshold(old, 0, 0.5) is None  # no KL index: none of them counts
+
+
+def test_threshold_startup_guard_follows_n_startup_trials() -> None:
+    trials = [frozen(0.1 * i, 0.1, kl_excess=-0.4) for i in range(1, 8)]
+    assert abort_threshold(trials, 0, 0.5, min_trials=8) is None
+    assert abort_threshold(trials, 0, 0.5, min_trials=7) is not None
 
 
 def test_make_trial_limits() -> None:
@@ -193,7 +273,8 @@ def test_make_trial_limits() -> None:
     )
     assert both is not None
     assert both.abort_threshold is not None
-    assert abs(both.abort_threshold - 0.4) < 1e-12
+    # Sorted .1 .. .7, the 0.75 quantile is at index 4.5 -> 0.55.
+    assert abs(both.abort_threshold - 0.55) < 1e-12
 
     only_abort = make_trial_limits(
         make_settings(kl_constraint=None, early_abort=True), [], 0
@@ -201,6 +282,21 @@ def test_make_trial_limits() -> None:
     assert only_abort is not None
     assert only_abort.kl_constraint is None
     assert only_abort.abort_threshold is None  # startup
+
+
+def test_make_trial_limits_waits_for_n_startup_trials() -> None:
+    trials = [frozen(0.1 * i, 0.1, kl_excess=-0.4) for i in range(1, 8)]
+
+    def settings(n_startup: int) -> HereticSettings:
+        return HereticSettings.model_construct(
+            n_startup_trials=n_startup, seed=1, kl_constraint=0.5, early_abort=True
+        )  # ty:ignore[invalid-argument-type]
+
+    # max(5, n_startup_trials) feasible trials are needed (7 exist).
+    for n_startup, active in ((2, True), (5, True), (7, True), (8, False), (30, False)):
+        limits = make_trial_limits(settings(n_startup), trials, 0)
+        assert limits is not None
+        assert (limits.abort_threshold is not None) is active, n_startup
 
 
 # ---------------------------------------------------------------- recording
@@ -289,7 +385,7 @@ def test_early_abort_fires_above_the_threshold() -> None:
     assert ctx.chunks == [10]
     assert ctx.limits.early_abort is True  # ty:ignore[unresolved-attribute]
     assert ctx.limits.partial is False  # ty:ignore[unresolved-attribute]
-    # The partial rate is the unbiased rate of the evaluated prompts.
+    # The partial rate is the rate of the evaluated prompts (biased upward by the stopping rule).
     assert score.value == 1.0
     assert score.md_display == "10/10"
 
@@ -452,6 +548,13 @@ def test_kl_above_the_limit_is_flagged_for_the_refusal_scorer() -> None:
     assert limits.kl_exceeded is True
 
 
+def test_kl_objective_index() -> None:
+    evaluator, _, _ = make_evaluator(0.1)
+    assert evaluator.kl_objective_index() == 2
+    evaluator._scorer_entries = evaluator._scorer_entries[:2]
+    assert evaluator.kl_objective_index() is None
+
+
 def test_get_kl_value_none_without_a_kl_scorer() -> None:
     evaluator, _, _ = make_evaluator(0.1)
     evaluator._scorer_entries = evaluator._scorer_entries[:2]
@@ -467,9 +570,6 @@ def test_get_kl_value_none_without_a_kl_scorer() -> None:
 def test_study_smoke_with_constraint_and_abort() -> None:
     # The loop of `main.objective` on a real in-memory study, with scripted scorers.
     settings = make_settings(kl_constraint=0.5, early_abort=True)
-    study = optuna.create_study(
-        sampler=build_sampler(settings), directions=["minimize", "minimize"]
-    )
     scorer = make_refusal_scorer()
     evaluator, _, _ = make_evaluator(0.0)
     evaluator._scorer_entries[0].scorer = scorer
@@ -477,6 +577,10 @@ def test_study_smoke_with_constraint_and_abort() -> None:
         evaluator._scorer_entries[0],
         evaluator._scorer_entries[2],
     ]
+    study = optuna.create_study(
+        sampler=build_sampler(settings, evaluator.kl_objective_index()),
+        directions=["minimize", "minimize"],
+    )
 
     script = iter(
         # (KL, refused prompts among p0..p29)
@@ -492,6 +596,7 @@ def test_study_smoke_with_constraint_and_abort() -> None:
             settings,
             trial.study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)),
             evaluator.refusal_objective_index(),
+            evaluator.kl_objective_index(),
         )
         assert limits is not None
         ctx = ChunkContext({f"p{i}" for i in range(refused)})
@@ -517,8 +622,8 @@ def test_study_smoke_with_constraint_and_abort() -> None:
     attrs = [t.user_attrs for t in study.trials]
     assert [a["kl_excess"] <= 0 for a in attrs] == [True] * 5 + [False, True, True]
     assert attrs[5].get("partial") is True and "early_abort" not in attrs[5]
-    # Median of the five feasible startup trials is 9/30; 30/30 refused is cut short,
-    # 2/30 is not.
+    # The 0.75 quantile of the five feasible startup trials is 12/30; 30/30 refused is cut
+    # short, 2/30 is not.
     assert attrs[6].get("early_abort") is True and "partial" not in attrs[6]
     assert "early_abort" not in attrs[7] and "partial" not in attrs[7]
     assert study.trials[6].values[0] == 1.0
