@@ -16,6 +16,7 @@ from optuna.trial import TrialState, create_trial
 from heretic.config import ScorerConfig
 from heretic.config import Settings as HereticSettings
 from heretic.evaluator import Evaluator, ScorerEntry
+from heretic.plugin import Context
 from heretic.scorer import Score
 from heretic.scorers.keyword_rate import KeywordRate, Settings
 from heretic.scorers.kl_divergence import KLDivergence
@@ -35,9 +36,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def make_settings(**kwargs: Any) -> HereticSettings:
-    return HereticSettings.model_construct(
-        n_startup_trials=2, seed=1, **kwargs
-    )  # ty:ignore[invalid-argument-type]
+    return HereticSettings.model_construct(n_startup_trials=2, seed=1, **kwargs)  # ty:ignore[invalid-argument-type]
 
 
 # ---------------------------------------------------------------- settings
@@ -99,7 +98,7 @@ def test_constraints_func_wired_and_receives_kl_excess() -> None:
     assert sampler._constraints_func is not None
 
     study = run_study([0.3, -0.1, 0.0])
-    stored = [t.system_attrs["constraints"] for t in study.trials]
+    stored = [list(t.system_attrs["constraints"]) for t in study.trials]
     assert stored == [[0.3], [-0.1], [0.0]]
 
 
@@ -107,7 +106,7 @@ def test_constraints_func_survives_a_trial_without_kl_excess() -> None:
     # Trials of an older journal, or interrupted before the KL score, have no kl_excess.
     # They count as infeasible instead of crashing the sampler.
     study = run_study([None, -0.2])
-    first, second = (t.system_attrs["constraints"] for t in study.trials)
+    first, second = (list(t.system_attrs["constraints"]) for t in study.trials)
     assert first[0] > 0
     assert second == [-0.2]
 
@@ -284,9 +283,7 @@ def test_scorer_without_limits_is_one_call_as_before() -> None:
 def test_early_abort_fires_above_the_threshold() -> None:
     scorer = make_refusal_scorer()
     # The first third (p0..p9) is refused completely: Wilson bound ~0.78 > 0.5.
-    ctx = ChunkContext(
-        {f"p{i}" for i in range(10)}, TrialLimits(abort_threshold=0.5)
-    )
+    ctx = ChunkContext({f"p{i}" for i in range(10)}, TrialLimits(abort_threshold=0.5))
     score = scorer.get_score(ctx)  # ty:ignore[invalid-argument-type]
     assert wilson_lower_bound(10, 10) > 0.5
     assert ctx.chunks == [10]
@@ -437,7 +434,7 @@ def test_kl_scorer_runs_before_the_refusal_scorer_under_limits() -> None:
 
 def test_kl_above_the_limit_is_flagged_for_the_refusal_scorer() -> None:
     CALLS.clear()
-    evaluator, refusals, _ = make_evaluator(0.9)
+    evaluator, _, _ = make_evaluator(0.9)
     limits = TrialLimits(kl_constraint=0.5)
     seen: list[bool] = []
     original = FakeRefusals.get_score
@@ -462,3 +459,67 @@ def test_get_kl_value_none_without_a_kl_scorer() -> None:
     scores = evaluator.get_scores()
     assert evaluator.get_kl_value(scores) is None
     assert evaluator.refusal_objective_index() == 0
+
+
+# ------------------------------------------------------------------- smoke
+
+
+def test_study_smoke_with_constraint_and_abort() -> None:
+    # The loop of `main.objective` on a real in-memory study, with scripted scorers.
+    settings = make_settings(kl_constraint=0.5, early_abort=True)
+    study = optuna.create_study(
+        sampler=build_sampler(settings), directions=["minimize", "minimize"]
+    )
+    scorer = make_refusal_scorer()
+    evaluator, _, _ = make_evaluator(0.0)
+    evaluator._scorer_entries[0].scorer = scorer
+    evaluator._scorer_entries = [
+        evaluator._scorer_entries[0],
+        evaluator._scorer_entries[2],
+    ]
+
+    script = iter(
+        # (KL, refused prompts among p0..p29)
+        [(0.1, 3), (0.2, 6), (0.3, 9), (0.1, 12), (0.4, 15)]  # startup, feasible
+        + [(0.9, 0), (0.2, 30), (0.2, 2)]
+    )
+
+    def objective(trial: optuna.Trial) -> tuple[float, float]:
+        kl, refused = next(script)
+        trial.suggest_float("x", 0.0, 1.0)
+        evaluator._scorer_entries[1].scorer.value = kl  # ty:ignore[unresolved-attribute]
+        limits = make_trial_limits(
+            settings,
+            trial.study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)),
+            evaluator.refusal_objective_index(),
+        )
+        assert limits is not None
+        ctx = ChunkContext({f"p{i}" for i in range(refused)})
+
+        # Route the scorer through the scripted context.
+        original = evaluator.get_scores
+
+        import heretic.evaluator as evaluator_module
+
+        class Ctx(evaluator_module.Context):
+            def get_responses(self, prompts: list[Prompt]) -> list[str]:
+                return ctx.get_responses(prompts)
+
+        evaluator_module.Context = Ctx  # ty:ignore[invalid-assignment]
+        try:
+            scores = original(limits)
+        finally:
+            evaluator_module.Context = Context
+        record_trial_limits(trial, limits, evaluator.get_kl_value(scores))
+        return evaluator.get_objective_values(scores)
+
+    study.optimize(objective, n_trials=8)
+    attrs = [t.user_attrs for t in study.trials]
+    assert [a["kl_excess"] <= 0 for a in attrs] == [True] * 5 + [False, True, True]
+    assert attrs[5].get("partial") is True and "early_abort" not in attrs[5]
+    # Median of the five feasible startup trials is 9/30; 30/30 refused is cut short,
+    # 2/30 is not.
+    assert attrs[6].get("early_abort") is True and "partial" not in attrs[6]
+    assert "early_abort" not in attrs[7] and "partial" not in attrs[7]
+    assert study.trials[6].values[0] == 1.0
+    assert abs(study.trials[7].values[0] - 2 / 30) < 1e-12

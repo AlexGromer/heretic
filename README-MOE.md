@@ -652,3 +652,20 @@ by a failing test; the tests came after.
 
 Tests: the new cases in `tests/test_judge_handoff.py` (what a resumed run keeps, both prompt file
 formats, the two new row fields).
+
+## 6. KL constraint and early abort (v12)
+
+Two settings, both off by default (a run without them behaves and journals as before). They are
+excluded from the settings stored in the study, so they come from the invocation, also on `continue`.
+
+* `kl_constraint = <float>`: Optuna's `constraints_func` marks a trial with a KL divergence above the
+  limit as infeasible (`kl_excess = KL - limit` is stored as a user attribute), so TPE searches the
+  useful zone instead of the whole refusals/KL curve. The KL scorer runs before the refusal scorer;
+  for an infeasible trial the refusal scorer evaluates only the first third of its prompts
+  (user attribute `partial = true`). Only the first minimized `KeywordRate` objective is affected.
+* `early_abort = true`: the refusal scorer counts in two chunks. After the first third of the prompts,
+  if the one-sided Wilson lower bound (z = 1.645) of the refusal rate is above the median refusal value
+  of the finished feasible trials, it stops and returns the rate of the evaluated prompts (an unbiased
+  estimate; user attribute `early_abort = true`). Inactive while fewer than 5 finished feasible trials
+  exist. Trials cut short are not used for the median. Use it with `kl_constraint`: without a
+  constraint, a trial with many refusals and a low KL divergence can be Pareto-optimal.
