@@ -656,16 +656,23 @@ formats, the two new row fields).
 ## 6. KL constraint and early abort (v12)
 
 Two settings, both off by default (a run without them behaves and journals as before). They are
-excluded from the settings stored in the study, so they come from the invocation, also on `continue`.
+excluded from the settings stored in the study, so they come from the invocation, also on `continue`
+and when the trial count is extended, where they apply to a journal that was written without them.
 
 * `kl_constraint = <float>`: Optuna's `constraints_func` marks a trial with a KL divergence above the
   limit as infeasible (`kl_excess = KL - limit` is stored as a user attribute), so TPE searches the
-  useful zone instead of the whole refusals/KL curve. The KL scorer runs before the refusal scorer;
-  for an infeasible trial the refusal scorer evaluates only the first third of its prompts
-  (user attribute `partial = true`). Only the first minimized `KeywordRate` objective is affected.
+  useful zone instead of the whole refusals/KL curve. Optuna sets a constraint once, when a trial finishes,
+  and treats a trial without one as feasible; so on `continue` or extended trials the sampler gives the finished
+  trials of an older journal (no `kl_excess`, no constraint) `KL - limit` from their stored KL objective value,
+  in memory only (the journal is not changed). A trial whose KL is unknown is left as it is. The KL scorer runs before the refusal scorer; for an infeasible
+  trial the refusal scorer evaluates only the first third of its prompts (user attribute `partial = true`).
+  Only the first minimized `KeywordRate` objective is affected.
 * `early_abort = true`: the refusal scorer counts in two chunks. After the first third of the prompts,
-  if the one-sided Wilson lower bound (z = 1.645) of the refusal rate is above the median refusal value
-  of the finished feasible trials, it stops and returns the rate of the evaluated prompts (an unbiased
-  estimate; user attribute `early_abort = true`). Inactive while fewer than 5 finished feasible trials
-  exist. Trials cut short are not used for the median. Use it with `kl_constraint`: without a
-  constraint, a trial with many refusals and a low KL divergence can be Pareto-optimal.
+  if the one-sided Wilson lower bound (z = 1.645) of the refusal rate is above the 0.75 quantile of the
+  refusal values of the finished feasible trials, it stops and returns the rate of the evaluated prompts
+  (user attribute `early_abort = true`). That rate is biased upward by the stopping rule (the trial stopped
+  because its first third looked bad). The threshold counts the early-aborted trials with that partial value:
+  leaving them out would pull the threshold down and make the abort ever more aggressive. Trials over the
+  KL limit (infeasible, `partial`) are not counted. Inactive while fewer than `max(5, n_startup_trials)`
+  finished feasible trials exist. Use it with `kl_constraint`: without a constraint, a trial with many
+  refusals and a low KL divergence can be Pareto-optimal.

@@ -303,8 +303,10 @@ class KeywordRate(Scorer):
             evaluated = len(self.prompts)
         else:
             # Chunked evaluation (fork addition): the first third of the prompts decides
-            # whether the rest is worth generating. The rate of the evaluated prompts is an
-            # unbiased estimate of the full rate, so a cut-short trial keeps it as its value.
+            # whether the rest is worth generating. A cut-short trial keeps the rate of the
+            # evaluated prompts as its value. After an early abort that rate is biased upward
+            # by the stopping rule (the trial stopped because its first chunk looked bad); for
+            # a trial over the KL limit it is the plain rate of the first chunk.
             first = self.prompts[: first_chunk_size(len(self.prompts))]
             match_count = self._count_matches(
                 first, ctx.get_responses(first), tokenizer, records

@@ -137,7 +137,9 @@ def run_study_values(
 
 def finished_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
     # The trials the sampler reads (the cached, not copied ones).
-    return study._get_trials(deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True)
+    return study._get_trials(
+        deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True
+    )
 
 
 def test_old_journal_trials_get_their_constraint_from_the_kl_objective_value(
@@ -194,7 +196,9 @@ def test_backfill_leaves_trials_with_unknown_kl_and_recorded_constraints() -> No
     first.system_attrs["constraints"] = [-5.0]
     study.tell(study.ask(), state=TrialState.FAIL)
     assert list(first.constraints.values()) == [-5.0]
-    assert [round(v, 12) for v in finished_trials(study)[1].constraints.values()] == [0.4]
+    assert [round(v, 12) for v in finished_trials(study)[1].constraints.values()] == [
+        0.4
+    ]
 
 
 def test_constraints_func_without_a_kl_objective_stays_infeasible() -> None:
@@ -284,7 +288,9 @@ def test_threshold_is_the_075_quantile_including_early_aborted_trials() -> None:
     threshold = abort_threshold(trials, 0, 0.5)
     assert threshold is not None and abs(threshold - 0.775) < 1e-12
     # Without the early-aborted trial: .1 .3 .5 .7 .9, index 3.0 -> 0.7 (the median was 0.5).
-    threshold = abort_threshold([t for t in trials if not t.user_attrs.get("early_abort")], 0, 0.5)
+    threshold = abort_threshold(
+        [t for t in trials if not t.user_attrs.get("early_abort")], 0, 0.5
+    )
     assert threshold is not None and abs(threshold - 0.7) < 1e-12
 
 

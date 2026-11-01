@@ -768,6 +768,7 @@ def run():
             settings,
             trial.study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)),
             evaluator.refusal_objective_index(),
+            evaluator.kl_objective_index(),
         )
         if limits is None:
             scores = evaluator.get_scores()
@@ -820,7 +821,7 @@ def run():
 
     if not reproduction_mode:
         study = optuna.create_study(
-            sampler=build_sampler(settings),
+            sampler=build_sampler(settings, evaluator.kl_objective_index()),
             storage=storage,
             directions=directions,
             study_name="heretic",

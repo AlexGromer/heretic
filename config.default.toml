@@ -178,12 +178,15 @@ judge_ranking_benchmarks = []
 
 # Upper limit of the KL divergence (fork addition, default unset = off). A trial above it is infeasible:
 # the sampler searches the feasible zone only, and the refusal scorer evaluates the first third of its
-# prompts for such a trial. Needs a KL divergence scorer. Not stored in the study; set it on every start.
+# prompts for such a trial. Needs a KL divergence scorer. Not stored in the study; set it on every start
+# (on continue / extend-trials of an older journal the finished trials are judged by their stored KL
+# objective value, in memory only).
 # kl_constraint = 0.5
 
 # Stop counting refusals after the first third of the prompts if the refusal rate is clearly worse
-# than the median of the finished feasible trials (fork addition, default false; inactive until 5
-# such trials exist). Meant for use with kl_constraint.
+# than the 0.75 quantile of the refusal values of the finished feasible trials, early-aborted ones
+# included with their partial value (fork addition, default false; inactive until
+# max(5, n_startup_trials) such trials exist). Meant for use with kl_constraint.
 # early_abort = true
 
 # Directory to save and load study progress to/from.

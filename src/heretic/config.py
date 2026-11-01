@@ -466,8 +466,9 @@ class Settings(BaseSettings):
         default=False,
         description=(
             "Whether to stop counting refusals of a trial after the first third of the prompts "
-            "if the one-sided Wilson lower bound of the refusal rate is above the median refusal "
-            "value of the finished feasible trials (inactive until 5 of them exist). The trial "
+            "if the one-sided Wilson lower bound of the refusal rate is above the 0.75 quantile of the "
+            "refusal values of the finished feasible trials, early-aborted ones included with their "
+            "partial value (inactive until max(5, n_startup_trials) of them exist). The trial "
             "keeps the rate of the evaluated prompts. Use it together with kl_constraint: without "
             "a constraint, a trial with many refusals and a low KL divergence can still be Pareto-optimal."
         ),
@@ -728,7 +729,7 @@ class Settings(BaseSettings):
             "it does not depend on the order of the menu, and any completed trial can be selected, "
             "not only Pareto optimal ones. Which trial to export is a choice of the single run, so "
             "this setting is not stored in the study and is not restored from it by "
-            '--checkpoint-action continue (unlike trial_index, which has to be written into the '
+            "--checkpoint-action continue (unlike trial_index, which has to be written into the "
             "stored settings to survive a resume)."
         ),
         exclude=True,

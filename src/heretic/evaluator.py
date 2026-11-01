@@ -198,6 +198,17 @@ class Evaluator:
             return None
         return self._objective_entries().index(refusal_entry)
 
+    def kl_objective_index(self) -> int | None:
+        """
+        Index among the objective values of the scorer `get_kl_value` reads (the first KL
+        divergence scorer), or None when there is none or it is not an objective.
+        """
+        for entry in self._scorer_entries:
+            if isinstance(entry.scorer, KLDivergence):
+                objectives = self._objective_entries()
+                return objectives.index(entry) if entry in objectives else None
+        return None
+
     def has_kl_scorer(self) -> bool:
         return any(isinstance(e.scorer, KLDivergence) for e in self._scorer_entries)
 
