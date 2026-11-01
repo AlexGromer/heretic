@@ -135,17 +135,66 @@ def run_study_values(
     return study
 
 
-def test_constraints_func_uses_the_kl_objective_value_when_the_attribute_is_missing() -> (
-    None
-):
-    # A journal of an older run (or a run without the limits) has no kl_excess, but the KL
-    # objective value is stored with the trial: excess = KL - limit.
-    study = run_study_values([(None, 0.8), (None, 0.2), (-0.4, 0.1)], kl_index=1)
-    stored = [list(t.system_attrs["constraints"]) for t in study.trials]
-    assert abs(stored[0][0] - 0.3) < 1e-12
-    assert abs(stored[1][0] - -0.3) < 1e-12
-    # The attribute wins over the objective value when both exist.
-    assert stored[2] == [-0.4]
+def finished_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
+    # The trials the sampler reads (the cached, not copied ones).
+    return study._get_trials(deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True)
+
+
+def test_old_journal_trials_get_their_constraint_from_the_kl_objective_value(
+    tmp_path: Any,
+) -> None:
+    # An older journal (written without the limits) has no kl_excess and no constraints.
+    # Optuna treats a trial without constraints as feasible and never calls constraints_func
+    # on a finished trial, so the sampler derives them from the stored KL objective value
+    # (index 1) when the study is continued: excess = KL - limit.
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend
+
+    path = str(tmp_path / "journal.log")
+    old = optuna.create_study(
+        storage=JournalStorage(JournalFileBackend(path)),
+        directions=["minimize", "minimize"],
+        study_name="heretic",
+    )
+    kls = [0.8, 0.2, 0.9, 0.5]
+    queue = list(kls)
+
+    def objective(trial: optuna.Trial) -> tuple[float, float]:
+        return trial.suggest_float("x", 0.0, 1.0), queue.pop(0)
+
+    old.optimize(objective, n_trials=len(kls))
+    assert all(not t.constraints for t in old.trials)
+
+    settings = make_settings(kl_constraint=0.5, early_abort=False)
+    study = optuna.create_study(
+        sampler=build_sampler(settings, 1),
+        storage=JournalStorage(JournalFileBackend(path)),
+        directions=["minimize", "minimize"],
+        study_name="heretic",
+        load_if_exists=True,
+    )
+    trial = study.ask()  # the sampler prepares the study before the next trial
+    study.tell(trial, state=TrialState.FAIL)
+    excess = [list(t.constraints.values()) for t in finished_trials(study)]
+    assert [[round(v, 12) for v in e] for e in excess] == [[0.3], [-0.3], [0.4], [0.0]]
+
+
+def test_backfill_leaves_trials_with_unknown_kl_and_recorded_constraints() -> None:
+    # No KL objective (kl_index None): nothing to derive from, the trial is left as it is.
+    settings = make_settings(kl_constraint=0.5, early_abort=False)
+    study = optuna.create_study(directions=["minimize", "minimize"])
+    study.optimize(lambda t: (t.suggest_float("x", 0, 1), 0.9), n_trials=2)
+    study.sampler = build_sampler(settings, None)
+    study.tell(study.ask(), state=TrialState.FAIL)
+    assert all(not t.constraints for t in finished_trials(study))
+
+    # A trial that has constraints keeps them.
+    study.sampler = build_sampler(settings, 1)
+    first = finished_trials(study)[0]
+    first.system_attrs["constraints"] = [-5.0]
+    study.tell(study.ask(), state=TrialState.FAIL)
+    assert list(first.constraints.values()) == [-5.0]
+    assert [round(v, 12) for v in finished_trials(study)[1].constraints.values()] == [0.4]
 
 
 def test_constraints_func_without_a_kl_objective_stays_infeasible() -> None:
