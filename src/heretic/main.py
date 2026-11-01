@@ -70,7 +70,6 @@ from huggingface_hub import HfApi, ModelCard, ModelCardData
 from lm_eval.models.huggingface import HFLM
 from optuna import Trial, TrialPruned
 from optuna.exceptions import ExperimentalWarning
-from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.trial import FrozenTrial, TrialState, create_trial
@@ -108,6 +107,7 @@ from .reproduce import (
     load_reproduction_information,
 )
 from .system import empty_cache, get_accelerator_info
+from .trial_limits import build_sampler, make_trial_limits, record_trial_limits
 from .utils import (
     HereticUserError,
     ask,
@@ -700,6 +700,31 @@ def run():
         )
         return
 
+    if (
+        settings.kl_constraint is not None
+        and not reproduction_mode
+        and not evaluator.has_kl_scorer()
+    ):
+        print()
+        print(
+            "[red]kl_constraint is set, but no KL divergence scorer is configured.[/]"
+        )
+        return
+
+    if settings.early_abort and not reproduction_mode:
+        if evaluator.refusal_objective_index() is None:
+            print()
+            print(
+                "[red]early_abort is set, but no minimized keyword rate objective is configured.[/]"
+            )
+            return
+        if settings.kl_constraint is None:
+            print()
+            print(
+                "[yellow]early_abort without kl_constraint:[/] a trial with many refusals and a "
+                "low KL divergence can be Pareto-optimal and may be cut short."
+            )
+
     print()
     print("Loading and initializing modifiers...")
     modifier_entries = load_and_init_modifiers(settings, model)
@@ -739,7 +764,26 @@ def run():
         print(f"* Modifying model using {modifier_name}...")
         modifier.modify_model(ctx, parameters)
         print("* Evaluating...")
-        scores = evaluator.get_scores()
+        limits = make_trial_limits(
+            settings,
+            trial.study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)),
+            evaluator.refusal_objective_index(),
+        )
+        if limits is None:
+            scores = evaluator.get_scores()
+        else:
+            if limits.abort_threshold is not None:
+                print(
+                    f"* Early abort above a refusal rate of [bold]{limits.abort_threshold:.4f}[/]"
+                )
+            scores = evaluator.get_scores(limits)
+            record_trial_limits(trial, limits, evaluator.get_kl_value(scores))
+            if limits.partial:
+                print(
+                    "* [yellow]KL divergence above the limit: refusals partially evaluated[/]"
+                )
+            if limits.early_abort:
+                print("* [yellow]Early abort: refusals partially evaluated[/]")
         objective_values = evaluator.get_objective_values(scores)
         for name, score in scores:
             print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
@@ -776,12 +820,7 @@ def run():
 
     if not reproduction_mode:
         study = optuna.create_study(
-            sampler=TPESampler(
-                n_startup_trials=settings.n_startup_trials,
-                n_ei_candidates=128,
-                multivariate=True,
-                seed=settings.seed,
-            ),
+            sampler=build_sampler(settings),
             storage=storage,
             directions=directions,
             study_name="heretic",
